@@ -1,7 +1,7 @@
 services:
   app:
     build: .
-    image: callioper/ebook-pdf-downloader-docker:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
     container_name: book-downloader
     ports:
       - "8000:8000"
