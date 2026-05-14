@@ -12,15 +12,6 @@ services:
       - config_data:/app/data
     restart: unless-stopped
 
-  book-searcher:
-    image: ghcr.io/callioper/book-searcher:latest
-    container_name: book-searcher
-    ports:
-      - "7789:7789"
-    volumes:
-      - ./db:/data
-    restart: unless-stopped
-
   stacks:
     image: zelest/stacks:latest
     container_name: stacks

@@ -27,7 +27,6 @@
 |------|------|:--:|------|
 | **app** | ACR | 8000 | 主程序：搜索、下载、OCR、书签 |
 | **stacks** | zelest/stacks | 7788 | AA 下载队列管理器 |
-| **book-searcher** | ghcr | 7789 | 本地 SQLite 数据库检索引擎 |
 | **flaresolverr** | ghcr | 8191 | Cloudflare / DDoS-Guard 绕过 |
 
 ---
@@ -65,15 +64,6 @@ services:
       - /volume1/docker/ebook/tmp:/tmp/bdw
       - /volume1/docker/ebook/db:/db
       - config_data:/app/data
-    restart: unless-stopped
-
-  book-searcher:
-    image: ghcr.io/callioper/book-searcher:latest
-    container_name: book-searcher
-    ports:
-      - "7789:7789"
-    volumes:
-      - /volume1/docker/ebook/db:/data
     restart: unless-stopped
 
   stacks:
@@ -132,15 +122,6 @@ services:
       - /share/Public/ebook/tmp:/tmp/bdw
       - /share/Public/ebook/db:/db
       - config_data:/app/data
-    restart: unless-stopped
-
-  book-searcher:
-    image: ghcr.io/callioper/book-searcher:latest
-    container_name: book-searcher
-    ports:
-      - "7789:7789"
-    volumes:
-      - /share/Public/ebook/db:/data
     restart: unless-stopped
 
   stacks:
@@ -234,7 +215,7 @@ docker compose up -d
 
 ### 第三步：本地数据库
 
-路径已默认 `/db`，`stacks_base_url` 设为 `http://stacks:7788` 后即可搜索本地数据库。也可通过 book-searcher（端口 7789）单独查询。
+路径已默认 `/db`，`stacks_base_url` 设为 `http://stacks:7788` 后即可搜索本地数据库。
 
 ### OCR 引擎
 
