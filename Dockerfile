@@ -43,10 +43,10 @@ RUN python3 -m venv /app/venv-paddle311 && \
 # Clone and setup local-llm-pdf-ocr (git is still installed here)
 RUN git clone --depth 1 https://github.com/Callioper/local-llm-pdf-ocr.git /app/local-llm-pdf-ocr && \
     cd /app/local-llm-pdf-ocr && \
-    python3 -m venv .venv && \
-    .venv/bin/pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
-    .venv/bin/pip install --no-cache-dir surya-ocr transformers && \
-    .venv/bin/pip install --no-cache-dir -e .
+    uv venv && \
+    uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision && \
+    uv pip install surya-ocr transformers pymupdf opencv-python-headless && \
+    uv pip install -e .
 
 # Remove git after clone to reduce image size
 RUN apt-get purge -y git && apt-get autoremove -y
