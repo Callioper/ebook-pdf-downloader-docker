@@ -35,6 +35,10 @@ config.json
 # Environment
 .env
 .env.*
+!.env.example
+
+# Docker override
+docker-compose.override.yml
 
 # Data files
 *.db

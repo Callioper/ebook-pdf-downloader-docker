@@ -404,7 +404,10 @@ async def available_dbs():
 async def get_config_endpoint():
     config = get_config()
     safe = dict(config)
-    safe.pop("zlib_password", None)
+    for key in ("zlib_password", "stacks_password", "stacks_api_key",
+                 "ai_vision_api_key", "ai_vision_zhipu_key", "ai_vision_doubao_key",
+                 "mineru_token", "paddleocr_online_token", "aa_membership_key"):
+        safe.pop(key, None)
     return safe
 
 
@@ -412,7 +415,10 @@ async def get_config_endpoint():
 async def update_config_endpoint(data: Dict[str, Any]):
     updated = update_config(data)
     safe = dict(updated)
-    safe.pop("zlib_password", None)
+    for key in ("zlib_password", "stacks_password", "stacks_api_key",
+                 "ai_vision_api_key", "ai_vision_zhipu_key", "ai_vision_doubao_key",
+                 "mineru_token", "paddleocr_online_token", "aa_membership_key"):
+        safe.pop(key, None)
     return safe
 
 
@@ -421,7 +427,10 @@ async def config_status():
     """Return full config + auto-detect statuses in one call to avoid N round trips."""
     cfg = get_config()
     safe = dict(cfg)
-    safe.pop("zlib_password", None)
+    for key in ("zlib_password", "stacks_password", "stacks_api_key",
+                 "ai_vision_api_key", "ai_vision_zhipu_key", "ai_vision_doubao_key",
+                 "mineru_token", "paddleocr_online_token", "aa_membership_key"):
+        safe.pop(key, None)
 
     import asyncio as _aio, os as _os
 

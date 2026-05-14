@@ -199,15 +199,15 @@ export default function Layout() {
     }
   }, [])
 
-  // Shutdown backend when page/electron window is closed
+  // Shutdown backend when page/electron window is closed (skip in Docker — managed by docker-compose)
   useEffect(() => {
+    if (isDocker) return
     const handleBeforeUnload = () => {
-      // Use sendBeacon — reliable during page unload (unlike fetch)
       navigator.sendBeacon('/api/v1/shutdown', '')
     }
     window.addEventListener('beforeunload', handleBeforeUnload)
     return () => window.removeEventListener('beforeunload', handleBeforeUnload)
-  }, [])
+  }, [isDocker])
 
   useEffect(() => {
     const heartbeat = setInterval(() => {

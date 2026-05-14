@@ -32,24 +32,22 @@ WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Install PaddleOCR (CPU version) at /app/venv-paddle311 (matches code search path)
-RUN python3 -m venv /app/venv-paddle311 && \
-    /app/venv-paddle311/bin/pip install --no-cache-dir \
+# Install PaddleOCR (CPU version) at /app/backend/venv-paddle311 (matches code search path)
+RUN python3 -m venv /app/backend/venv-paddle311 && \
+    /app/backend/venv-paddle311/bin/pip install --no-cache-dir \
     paddlepaddle \
     paddleocr \
     ocrmypdf \
     ocrmypdf_paddleocr
 
-# Clone and setup local-llm-pdf-ocr (git is still installed here)
+# Clone, setup, and clean up in a single layer to avoid git bloat in final image
 RUN git clone --depth 1 https://github.com/Callioper/local-llm-pdf-ocr.git /app/local-llm-pdf-ocr && \
     cd /app/local-llm-pdf-ocr && \
     uv venv && \
     uv pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision && \
     uv pip install surya-ocr transformers pymupdf opencv-python-headless && \
-    uv pip install -e .
-
-# Remove git after clone to reduce image size
-RUN apt-get purge -y git && apt-get autoremove -y
+    uv pip install . && \
+    apt-get purge -y git && apt-get autoremove -y
 
 COPY backend/ ./backend/
 COPY config.default.json ./config.default.json
@@ -59,7 +57,7 @@ COPY --from=frontend-builder /src/dist ./frontend/dist/
 RUN mkdir -p /downloads /finished /tmp/bdw /app/data /db
 
 # Create non-root user
-RUN useradd -m -u 1000 app && chown -R app:app /app /downloads /finished /tmp/bdw
+RUN useradd -m -u 1000 app && chown -R app:app /app /downloads /finished /tmp/bdw /db
 USER app
 
 EXPOSE 8000

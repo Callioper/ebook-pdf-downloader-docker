@@ -33,8 +33,8 @@ services:
       - ./downloads:/opt/stacks/download
       - ./stacks-logs:/opt/stacks/logs
     environment:
-      - USERNAME=admin
-      - PASSWORD=stacks
+      - USERNAME=${STACKS_USER:-admin}
+      - PASSWORD=${STACKS_PASS:?请设置 STACKS_PASS 环境变量，或创建 .env 文件}
       - SOLVERR_URL=flaresolverr:8191
       - TZ=Asia/Shanghai
     restart: unless-stopped

@@ -179,7 +179,7 @@ volumes:
 4. 将 `DX_2.0-5.0.db` 上传到 `db`
 5. 创建 → 访问 `http://<NAS_IP>:8000`
 
-> 私有镜像仓库需先添加：Container Station → 设置 → Registry → 新增 `crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com`，用户 `yy981204`
+> 私有镜像仓库需先添加：Container Station → 设置 → Registry → 新增 `crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com`，用户名改为你的 ACR 账号
 
 ---
 
