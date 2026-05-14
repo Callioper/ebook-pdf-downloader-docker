@@ -13,7 +13,7 @@ services:
     restart: unless-stopped
 
   stacks:
-    image: zelest/stacks:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/stacks:latest
     container_name: stacks
     stop_signal: SIGTERM
     stop_grace_period: 30s
@@ -31,7 +31,7 @@ services:
     restart: unless-stopped
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/flaresolverr:latest
     container_name: flaresolverr
     ports:
       - "8191:8191"

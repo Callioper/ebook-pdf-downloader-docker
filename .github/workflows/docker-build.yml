@@ -65,6 +65,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Mirror stacks + flaresolverr to ACR
+        run: |
+          docker pull zelest/stacks:latest
+          docker tag zelest/stacks:latest ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/stacks:latest
+          docker push ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/stacks:latest
+
+          docker pull ghcr.io/flaresolverr/flaresolverr:latest
+          docker tag ghcr.io/flaresolverr/flaresolverr:latest ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/flaresolverr:latest
+          docker push ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/flaresolverr:latest
+
       - name: Sync README to Docker Hub
         env:
           DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}

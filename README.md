@@ -26,8 +26,10 @@
 | 服务 | 镜像 | 端口 | 用途 |
 |------|------|:--:|------|
 | **app** | ACR | 8000 | 主程序：搜索、下载、OCR、书签 |
-| **stacks** | zelest/stacks | 7788 | AA 下载队列管理器 |
-| **flaresolverr** | ghcr | 8191 | Cloudflare / DDoS-Guard 绕过 |
+| **stacks** | ACR | 7788 | AA 下载队列管理器（ACR 镜像由 Actions 自动同步） |
+| **flaresolverr** | ACR | 8191 | Cloudflare / DDoS-Guard 绕过（ACR 镜像由 Actions 自动同步） |
+
+> 三服务默认均使用阿里云 ACR（国内秒级拉取）。备选地址见"镜像地址"章节。
 
 ---
 
@@ -67,7 +69,7 @@ services:
     restart: unless-stopped
 
   stacks:
-    image: zelest/stacks:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/stacks:latest
     container_name: stacks
     stop_signal: SIGTERM
     stop_grace_period: 30s
@@ -85,7 +87,7 @@ services:
     restart: unless-stopped
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/flaresolverr:latest
     container_name: flaresolverr
     ports:
       - "8191:8191"
@@ -125,7 +127,7 @@ services:
     restart: unless-stopped
 
   stacks:
-    image: zelest/stacks:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/stacks:latest
     container_name: stacks
     stop_signal: SIGTERM
     stop_grace_period: 30s
@@ -143,7 +145,7 @@ services:
     restart: unless-stopped
 
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/flaresolverr:latest
     container_name: flaresolverr
     ports:
       - "8191:8191"
@@ -197,6 +199,8 @@ docker compose up -d
 ## ⚙️ 初始化配置
 
 访问 `http://<IP>:8000`，右上角 ⚙️ 进入设置。
+
+> **三服务均使用阿里云 ACR**，Actions 自动同步。如遇拉取问题，检查是否已添加 ACR 私有仓库认证。
 
 ### 第一步：配置 Stacks（AA 下载服务器）
 
