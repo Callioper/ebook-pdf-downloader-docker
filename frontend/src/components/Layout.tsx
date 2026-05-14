@@ -35,6 +35,7 @@ export default function Layout() {
   const [checkResult, setCheckResult] = useState('')
   const resultTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const themeCleanupRef = useRef<(() => void) | null>(null)
 
   // System status check
   const [sysStatus, setSysStatus] = useState<{all_ok?: boolean; failures?: string[]; ocr_engine?: string; components?: Record<string, {ok:boolean;detail:string;balance?:string}>} | null>(null)
@@ -136,7 +137,7 @@ export default function Layout() {
             const theme = cfg.theme || 'auto'
             localStorage.setItem('theme', theme)
             const cleanup = applyTheme(theme)
-            return cleanup
+            if (typeof cleanup === 'function') themeCleanupRef.current = cleanup
           })
           .catch(() => {}),
 
@@ -193,6 +194,9 @@ export default function Layout() {
       setAppReady(true)
     }
     init()
+    return () => {
+      themeCleanupRef.current?.()
+    }
   }, [])
 
   // Shutdown backend when page/electron window is closed

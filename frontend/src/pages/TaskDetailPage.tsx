@@ -32,7 +32,7 @@ export default function TaskDetailPage() {
     if (!taskId) return
     try {
       const { data } = await axios.get(`${API_BASE}/tasks/${taskId}`)
-      setTask(data)
+      setTask((prev) => prev ? { ...prev, ...data } : data)
       setLoading(false)
     } catch (e: any) {
       setError(e.message)
@@ -75,8 +75,8 @@ export default function TaskDetailPage() {
               step_eta: (msg.eta as string) || prev.step_eta,
               stage: (msg.stage as string) || prev.stage,
               stage_progress: (msg.stage_progress as number) ?? prev.stage_progress,
-              current_page: (msg.current_page as number) || prev.current_page,
-              total_pages: (msg.total_pages as number) || prev.total_pages,
+              current_page: (msg.current_page as number) ?? prev.current_page,
+              total_pages: (msg.total_pages as number) ?? prev.total_pages,
             }
           : prev
       )

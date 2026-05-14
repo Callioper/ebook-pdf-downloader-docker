@@ -36,6 +36,7 @@ export const useStore = create<AppState>((set, get) => ({
   isDocker: false,
 
   fetchConfig: async () => {
+    set({ error: '' })
     try {
       const { data } = await axios.get(`${API_BASE}/config`)
       set({ config: data })
@@ -45,6 +46,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   updateConfig: async (updates) => {
+    set({ error: '' })
     try {
       const { data } = await axios.post(`${API_BASE}/config`, updates)
       set({ config: data })
@@ -84,6 +86,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   fetchAvailableDbs: async () => {
+    set({ error: '' })
     try {
       const { data } = await axios.get(`${API_BASE}/available-dbs`)
       set({ availableDbs: data.dbs || [] })

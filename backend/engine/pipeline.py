@@ -2239,14 +2239,17 @@ async def _step_ocr(task_id: str, task: Dict[str, Any], config: Dict[str, Any], 
                 os.path.join(_base_dir, "venv-paddle311", "bin", "python3"),
                 sys.executable,
             ]:
-                if os.path.exists(_cand):
-                    # Verify the venv has all needed packages
+                if not os.path.exists(_cand):
+                    continue
+                try:
                     _vr = _sp.run([_cand, "-c", "import ocrmypdf_paddleocr"],
                                   capture_output=True, timeout=15)
                     if _vr.returncode == 0:
                         _paddle_venv_py = _cand
                         task_store.add_log(task_id, f"PaddleOCR: using venv at {_paddle_venv_py}")
                         break
+                except Exception as _ce:
+                    task_store.add_log(task_id, f"PaddleOCR: candidate {_cand} skipped: {_ce}")
             if not _paddle_venv_py:
                 task_store.add_log(task_id,
                     "PaddleOCR: Python 3.11 venv not found — 点击设置页 OCR → PaddleOCR → 安装 自动搭建")

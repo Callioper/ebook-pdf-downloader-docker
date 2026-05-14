@@ -1,16 +1,50 @@
-backend/venv/
-backend/venv-paddle311/
-backend/__pycache__/
-backend/**/__pycache__/
-backend/*.pyc
-backend/build/
-backend/dist/
+# Python
+**/venv*/
+**/venv-paddle311/
+.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
 *.spec
-frontend/node_modules/
+
+# Node
+node_modules/
 frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# App runtime
 app.log
 tasks.json
 config.json
+
+# Environment
+.env
+.env.*
+
+# Data files
+*.db
+*.sqlite
+*.sqlite3
+downloads/
+finished/
+tmp/
+ebook-db/
+
+# Build outputs
 *.exe
-.DS_Store
-Thumbs.db
+*.dmg

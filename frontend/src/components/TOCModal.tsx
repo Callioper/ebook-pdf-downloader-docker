@@ -27,9 +27,13 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
   const [alignedPage, setAlignedPage] = useState<number | null>(null)
   const [firstBookmarkPage, setFirstBookmarkPage] = useState(1)
   const previewBlobRef = useRef<string>('')
+  const mountedRef = useRef(true)
 
   useEffect(() => {
-    return () => { if (previewBlobRef.current) URL.revokeObjectURL(previewBlobRef.current) }
+    return () => {
+      mountedRef.current = false
+      if (previewBlobRef.current) URL.revokeObjectURL(previewBlobRef.current)
+    }
   }, [])  // 1-indexed, extracted from bookmark line 1
 
   useEffect(() => {
@@ -41,10 +45,11 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
     })
       .then((r) => r.json())
       .then((d) => {
+        if (!mountedRef.current) return
         setTotalPages(d.pages)
         if (d.pages < 10) setEndPage(d.pages - 1)
       })
-      .catch(() => setError('无法获取 PDF 信息'))
+      .catch(() => { if (mountedRef.current) setError('无法获取 PDF 信息') })
   }, [visible, pdfPath])
 
   const loadPreviews = async () => {
@@ -55,6 +60,7 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
       body: JSON.stringify({ pdf_path: pdfPath, start_page: startPage, end_page: endPage }),
     })
     const data = await res.json()
+    if (!mountedRef.current) return
     setPageImages(data.pages || [])
   }
 
@@ -68,6 +74,7 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
     })
     if (res.ok) {
       const blob = await res.blob()
+      if (!mountedRef.current) return
       if (previewBlobRef.current) URL.revokeObjectURL(previewBlobRef.current)
       const url = URL.createObjectURL(blob)
       previewBlobRef.current = url
@@ -89,6 +96,7 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
       }),
     })
     const data = await res.json()
+    if (!mountedRef.current) return
     if (data.error) {
       setError(data.error)
       setStage('select')
@@ -118,6 +126,7 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
         body: JSON.stringify({ pdf_path: pdfPath, bookmark: finalBookmark, offset }),
       })
       const d = await r.json()
+      if (!mountedRef.current) return
       if (d.ok) {
         setInjectMsg(d.message || '完成')
         setStage('done')
@@ -134,8 +143,10 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
         setStage('preview')
       }
     } catch (e) {
-      setError(String(e))
-      setStage('preview')
+      if (mountedRef.current) {
+        setError(String(e))
+        setStage('preview')
+      }
     }
   }
 

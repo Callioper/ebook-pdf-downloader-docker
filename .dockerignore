@@ -6,6 +6,9 @@ __pycache__/
 .eggs/
 build/
 *.spec
+**/venv*/
+**/venv-paddle311/
+.venv/
 
 # Node
 frontend/node_modules/
@@ -19,15 +22,35 @@ frontend/dist/
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
+Desktop.ini
+
+# Docker
+Dockerfile
+Dockerfile.*
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
 
 # App runtime
 app.log
 tasks.json
 config.json
+
+# Environment
+.env
+.env.*
+
+# Backup / DB files
+*.db
+*.sqlite
+*.sqlite3
 
 # Docs
 docs/
@@ -35,10 +58,17 @@ docs/
 # Build outputs
 *.exe
 *.dmg
+backend/static/
 
 # Tests
 tests/
 .pytest_cache/
+
+# Runtime data dirs
+downloads/
+finished/
+tmp/
+ebook-db/
 
 # Misc
 *.iss

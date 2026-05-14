@@ -663,7 +663,7 @@ export default function ConfigSettings() {
       setOcrStatus(info.installed ? 'green' : 'red')
       setOcrMsg(info.msg || (info.installed ? '已安装' : '未检测到'))
     }
-  }, [form.ocr_engine, ocrEngines])
+  }, [form.ocr_engine])
 
   // Auto-detect stacks on config load (health + login)
   const autoStacksRef = useRef(false)

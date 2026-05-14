@@ -22,7 +22,8 @@ def is_linux() -> bool:
 
 
 def is_docker() -> bool:
-    return os.environ.get("DOCKER", "").lower() == "true"
+    v = os.environ.get("DOCKER", "").lower()
+    return v in ("true", "1", "yes")
 
 
 # ── Config / App Data Directory ──
