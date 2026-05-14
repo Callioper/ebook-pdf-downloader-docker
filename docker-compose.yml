@@ -2,6 +2,8 @@ services:
   app:
     image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
     container_name: book-downloader
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # 让容器能访问宿主机代理 (Clash)
     ports:
       - "8000:8000"
     volumes:

@@ -58,6 +58,8 @@ services:
   app:
     image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
     container_name: book-downloader
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:
@@ -116,6 +118,8 @@ services:
   app:
     image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
     container_name: book-downloader
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     volumes:
@@ -215,7 +219,7 @@ docker compose up -d
 | 配置项 | 说明 |
 |--------|------|
 | `zlib_email` / `zlib_password` | Z-Library 账号 |
-| `http_proxy` | 代理地址（国内访问外网需要） |
+| `http_proxy` | 代理地址。宿主机 Clash 填 `http://host.docker.internal:7890`（不要用 `192.168.x.x`） |
 
 ### 第三步：本地数据库
 
