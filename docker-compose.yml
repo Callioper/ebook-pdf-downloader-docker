@@ -22,10 +22,21 @@ services:
     restart: unless-stopped
 
   stacks:
-    image: zelestcarlyone/stacks:latest
+    image: zelest/stacks:latest
     container_name: stacks
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
     ports:
       - "7788:7788"
+    volumes:
+      - ./stacks-config:/opt/stacks/config
+      - ./downloads:/opt/stacks/download
+      - ./stacks-logs:/opt/stacks/logs
+    environment:
+      - USERNAME=admin
+      - PASSWORD=stacks
+      - SOLVERR_URL=flaresolverr:8191
+      - TZ=Asia/Shanghai
     restart: unless-stopped
 
   flaresolverr:
