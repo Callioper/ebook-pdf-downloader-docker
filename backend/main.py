@@ -116,7 +116,8 @@ async def heartbeat():
 
 @app.get("/api/v1/health")
 async def health():
-    return {"ok": True, "status": "running"}
+    from platform_utils import is_docker
+    return {"ok": True, "status": "running", "docker": is_docker()}
 
 
 @app.post("/api/v1/shutdown")

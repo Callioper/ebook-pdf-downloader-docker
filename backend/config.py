@@ -42,9 +42,9 @@ def _get_default_config_path() -> Path:
 DEFAULT_CONFIG: Dict[str, Any] = {
     "host": "0.0.0.0",
     "port": 8000,
-    "download_dir": "",
-    "finished_dir": "",
-    "tmp_dir": "",
+    "download_dir": "/downloads" if os.environ.get("DOCKER", "").lower() == "true" else "",
+    "finished_dir": "/finished" if os.environ.get("DOCKER", "").lower() == "true" else "",
+    "tmp_dir": "/tmp/bdw" if os.environ.get("DOCKER", "").lower() == "true" else "",
     "stacks_base_url": "http://localhost:7788",
     "zfile_base_url": "",
     "zfile_external_url": "",

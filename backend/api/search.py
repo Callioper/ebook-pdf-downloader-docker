@@ -28,6 +28,7 @@ from fastapi import APIRouter, File, Query, Request, UploadFile
 from pydantic import BaseModel
 
 from config import get_config, init_config, update_config
+from platform_utils import is_docker
 from search_engine import search_engine, detect_database_paths
 from version import VERSION, GITHUB_REPO
 
@@ -1772,6 +1773,8 @@ async def download_progress():
 
 @router.post("/install-update")
 async def install_update():
+    if is_docker():
+        return {"ok": False, "error": "Docker 版本请使用 docker compose pull && docker compose up -d 升级"}
     try:
         import sys
         exe_path = sys.executable

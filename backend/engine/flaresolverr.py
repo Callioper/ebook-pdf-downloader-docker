@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 import requests
+from platform_utils import is_docker
 
 logger = logging.getLogger(__name__)
 _flare_process: Optional[subprocess.Popen] = None
@@ -172,8 +173,14 @@ async def check_flaresolverr(config: Dict[str, Any]) -> bool:
 async def start_flaresolverr(config: Dict[str, Any]) -> Tuple[bool, str]:
     """Returns (success, error_message)."""
     global _flare_process
-    # Set module-level port so other functions use the right one
     set_flare_port(_get_flare_port(config))
+
+    if is_docker():
+        if await check_flaresolverr(config):
+            return (True, "FlareSolverr container is running")
+        else:
+            return (False, "FlareSolverr container not reachable at " + _flare_url(_get_flare_port(config)))
+
     if await check_flaresolverr(config):
         return (True, "already running")
 
@@ -239,6 +246,9 @@ async def start_flaresolverr(config: Dict[str, Any]) -> Tuple[bool, str]:
 
 def stop_flaresolverr():
     global _flare_process
+    if is_docker():
+        _flare_process = None
+        return
     if _flare_process:
         try:
             _flare_process.terminate()
