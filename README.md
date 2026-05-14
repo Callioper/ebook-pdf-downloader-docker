@@ -88,8 +88,8 @@ services:
       - /volume1/docker/ebook/downloads:/opt/stacks/download
       - /volume1/docker/ebook/stacks-logs:/opt/stacks/logs
     environment:
-      - USERNAME=${STACKS_USER:-admin}
-      - PASSWORD=${STACKS_PASS:?请设置密码}
+      - USERNAME=admin
+      - PASSWORD=请修改此密码
       - SOLVERR_URL=flaresolverr:8191
       - TZ=Asia/Shanghai
     restart: unless-stopped
@@ -155,8 +155,8 @@ services:
       - /share/Public/ebook/downloads:/opt/stacks/download
       - /share/Public/ebook/stacks-logs:/opt/stacks/logs
     environment:
-      - USERNAME=${STACKS_USER:-admin}
-      - PASSWORD=${STACKS_PASS:?请设置密码}
+      - USERNAME=admin
+      - PASSWORD=请修改此密码
       - SOLVERR_URL=flaresolverr:8191
       - TZ=Asia/Shanghai
     restart: unless-stopped
