@@ -9,9 +9,26 @@
 
 > **Docker 镜像版** — 基于 [ebook-pdf-downloader](https://github.com/Callioper/ebook-pdf-downloader) v1.3.0，全 OCR 引擎内置（Tesseract + PaddleOCR + Surya 版面检测），`docker compose up -d` 一键部署。
 
+> **国内用户**：使用阿里云 ACR 镜像（`registry.cn-shanghai.aliyuncs.com`），无需代理，秒级拉取。
+
 ---
 
-## ✨ 功能特性
+## 🚀 快速启动
+
+```bash
+# 国内用户（推荐，阿里云 ACR）
+docker pull crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
+
+# 国际用户（GitHub Container Registry）
+docker pull ghcr.io/callioper/ebook-pdf-downloader-docker:latest
+```
+
+或本地构建：
+```bash
+git clone https://github.com/Callioper/ebook-pdf-downloader-docker.git
+cd ebook-pdf-downloader-docker
+docker compose up -d
+```
 
 - **🔍 多源检索**: 本地 SQLite 电子书数据库（EbookDatabase）+ Anna's Archive + Z-Library eAPI + LibGen 回退
 - **📥 智能下载**: Stacks 队列管理 AA 下载，FlareSolverr 绕过 Cloudflare/DDoS-Guard，Z-Library 邮箱登录直达
