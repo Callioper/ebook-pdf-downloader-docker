@@ -28,6 +28,7 @@ from search_engine import search_engine
 from task_store import task_store
 from version import VERSION
 from engine.flaresolverr import stop_flaresolverr
+from platform_utils import is_docker
 
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     try:
@@ -116,7 +117,6 @@ async def heartbeat():
 
 @app.get("/api/v1/health")
 async def health():
-    from platform_utils import is_docker
     return {"ok": True, "status": "running", "docker": is_docker()}
 
 

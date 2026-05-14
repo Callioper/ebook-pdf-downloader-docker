@@ -38,6 +38,8 @@ def get_app_data_dir(app_name: str = "ebook-pdf-downloader") -> Path:
 
 def _get_dev_data_dir(app_name: str) -> Path:
     """Dev mode: return project root where config files live."""
+    if is_docker():
+        return Path("/app/data")
     return Path(__file__).resolve().parent.parent
 
 
@@ -54,9 +56,7 @@ def _get_frozen_data_dir(app_name: str) -> Path:
 
 
 def get_config_file() -> Path:
-    if getattr(sys, 'frozen', False):
-        return get_app_data_dir() / "config.json"
-    return Path(__file__).resolve().parent.parent / "config.json"
+    return get_app_data_dir() / "config.json"
 
 
 def get_default_config_file() -> Path:
@@ -66,9 +66,7 @@ def get_default_config_file() -> Path:
 
 
 def get_tasks_file() -> Path:
-    if getattr(sys, 'frozen', False):
-        return get_app_data_dir() / "tasks.json"
-    return Path(__file__).resolve().parent.parent / "tasks.json"
+    return get_app_data_dir() / "tasks.json"
 
 
 # ── File / Folder Opening ──

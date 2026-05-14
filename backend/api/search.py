@@ -1172,8 +1172,10 @@ async def check_ocr(engine: str = Query(default="")):
         elif engine == "paddleocr":
             _base_dir = os.path.dirname(os.path.dirname(__file__))
             _venv_candidates = [
-                r"D:\opencode\book-downloader\venv-paddle311\Scripts\python.exe",
                 os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
+                os.path.join(_base_dir, "venv-paddle311", "bin", "python"),
+                os.path.join(_base_dir, "venv-paddle311", "bin", "python3"),
+                sys.executable,
             ]
             for _venv_py in _venv_candidates:
                 if os.path.exists(_venv_py):

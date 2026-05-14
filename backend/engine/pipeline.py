@@ -2234,7 +2234,6 @@ async def _step_ocr(task_id: str, task: Dict[str, Any], config: Dict[str, Any], 
         if ocr_engine == "paddleocr":
             _base_dir = os.path.dirname(os.path.dirname(__file__))
             for _cand in [
-                r"D:\opencode\book-downloader\venv-paddle311\Scripts\python.exe",
                 os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
                 os.path.join(_base_dir, "venv-paddle311", "bin", "python"),
                 os.path.join(_base_dir, "venv-paddle311", "bin", "python3"),

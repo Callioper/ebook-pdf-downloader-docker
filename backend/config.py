@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from platform_utils import is_docker
+
 logger = logging.getLogger(__name__)
 
 def _get_app_dir() -> Path:
@@ -30,7 +32,8 @@ def _get_app_dir() -> Path:
                 return old_dir
         new_dir.mkdir(parents=True, exist_ok=True)
         return new_dir
-    return Path(__file__).resolve().parent.parent
+    from platform_utils import get_app_data_dir as _get_ad, is_docker as _is_docker
+    return _get_ad() if _is_docker() else Path(__file__).resolve().parent.parent
 
 CONFIG_FILE = _get_app_dir() / "config.json"
 APP_DATA_DIR = _get_app_dir()
@@ -42,9 +45,9 @@ def _get_default_config_path() -> Path:
 DEFAULT_CONFIG: Dict[str, Any] = {
     "host": "0.0.0.0",
     "port": 8000,
-    "download_dir": "/downloads" if os.environ.get("DOCKER", "").lower() == "true" else "",
-    "finished_dir": "/finished" if os.environ.get("DOCKER", "").lower() == "true" else "",
-    "tmp_dir": "/tmp/bdw" if os.environ.get("DOCKER", "").lower() == "true" else "",
+    "download_dir": "/downloads" if is_docker() else "",
+    "finished_dir": "/finished" if is_docker() else "",
+    "tmp_dir": "/tmp/bdw" if is_docker() else "",
     "stacks_base_url": "http://localhost:7788",
     "zfile_base_url": "",
     "zfile_external_url": "",

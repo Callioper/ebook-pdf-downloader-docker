@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     git \
     curl \
+    && apt-get purge -y git \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
@@ -32,9 +34,9 @@ WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Install PaddleOCR (CPU version) in a venv for the pipeline to discover
-RUN python3 -m venv /app/backend/venv-paddle311 && \
-    /app/backend/venv-paddle311/bin/pip install --no-cache-dir \
+# Install PaddleOCR (CPU version) at /app/venv-paddle311 (matches code search path)
+RUN python3 -m venv /app/venv-paddle311 && \
+    /app/venv-paddle311/bin/pip install --no-cache-dir \
     paddlepaddle \
     paddleocr \
     ocrmypdf \
@@ -43,18 +45,23 @@ RUN python3 -m venv /app/backend/venv-paddle311 && \
 # Clone and setup local-llm-pdf-ocr
 RUN git clone --depth 1 https://github.com/Callioper/local-llm-pdf-ocr.git /app/local-llm-pdf-ocr && \
     cd /app/local-llm-pdf-ocr && \
-    uv sync || echo "uv sync warning: continuing"
+    uv sync
 
 COPY backend/ ./backend/
 COPY config.default.json ./config.default.json
 
 COPY --from=frontend-builder /src/dist ./frontend/dist/
 
-RUN mkdir -p /downloads /finished /tmp/bdw
+RUN mkdir -p /downloads /finished /tmp/bdw /app/data
+
+# Create non-root user
+RUN useradd -m -u 1000 app && chown -R app:app /app /downloads /finished /tmp/bdw
+USER app
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
+    CMD curl -f http://localhost:8000/api/v1/health || exit 1
 
-ENTRYPOINT ["python", "backend/main.py", "--no-browser"]
+ENTRYPOINT ["python", "backend/main.py"]
+CMD ["--no-browser"]
