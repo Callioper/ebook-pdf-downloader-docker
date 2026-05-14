@@ -1,16 +1,15 @@
 services:
   app:
-    build: .
     image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
     container_name: book-downloader
     ports:
       - "8000:8000"
     volumes:
-      - config_data:/app/data
-      - ./downloads:/downloads
-      - ./finished:/finished
-      - ./tmp:/tmp/bdw
-      - ./db:/db
+      - /share/Public/ebook/downloads:/downloads
+      - /share/Public/ebook/finished:/finished
+      - /share/Public/ebook/tmp:/tmp/bdw
+      - /share/Public/ebook/db:/db
+      - ebook_config:/app/data
     restart: unless-stopped
 
   stacks:
@@ -19,10 +18,8 @@ services:
     ports:
       - "7788:7788"
     volumes:
-      - ./ebook-db:/data
+      - /share/Public/ebook/db:/data
     restart: unless-stopped
-    profiles:
-      - full
 
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -32,8 +29,6 @@ services:
     environment:
       - LOG_LEVEL=info
     restart: unless-stopped
-    profiles:
-      - full
 
 volumes:
-  config_data:
+  ebook_config:
