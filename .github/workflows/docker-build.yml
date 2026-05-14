@@ -49,7 +49,7 @@ jobs:
             ghcr.io/callioper/ebook-pdf-downloader-docker:1.3.0
             ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/ebook-pdf-downloader-docker:latest
             ${{ secrets.ACR_REGISTRY }}/${{ secrets.ACR_NAMESPACE }}/ebook-pdf-downloader-docker:1.3.0
-            407811164/ebook-pdf-downloader-docker:latest
-            407811164/ebook-pdf-downloader-docker:1.3.0
+            elevenforhp/ebook-pdf-downloader-docker:latest
+            elevenforhp/ebook-pdf-downloader-docker:1.3.0
           cache-from: type=gha
           cache-to: type=gha,mode=max

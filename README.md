@@ -14,6 +14,7 @@
 | Registry | 适用 | 命令 |
 |----------|------|------|
 | **阿里云 ACR**（推荐） | 国内，秒级拉取 | `docker pull crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest` |
+| **Docker Hub** | 通用 | `docker pull elevenforhp/ebook-pdf-downloader-docker:latest` |
 | **GitHub GHCR** | 国际 | `docker pull ghcr.io/callioper/ebook-pdf-downloader-docker:latest` |
 
 ---
