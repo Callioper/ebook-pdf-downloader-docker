@@ -43,7 +43,9 @@ RUN python3 -m venv /app/venv-paddle311 && \
 # Clone and setup local-llm-pdf-ocr (git is still installed here)
 RUN git clone --depth 1 https://github.com/Callioper/local-llm-pdf-ocr.git /app/local-llm-pdf-ocr && \
     cd /app/local-llm-pdf-ocr && \
-    uv sync
+    uv sync && \
+    .venv/bin/pip list --format=freeze 2>/dev/null | grep -i nvidia | cut -d= -f1 | xargs -r .venv/bin/pip uninstall -y && \
+    .venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # Remove git after clone to reduce image size
 RUN apt-get purge -y git && apt-get autoremove -y
