@@ -48,3 +48,4 @@ ebook-db/
 # Build outputs
 *.exe
 *.dmg
+*.tar
