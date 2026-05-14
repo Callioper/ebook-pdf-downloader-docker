@@ -1,0 +1,16 @@
+backend/venv/
+backend/venv-paddle311/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/build/
+backend/dist/
+*.spec
+frontend/node_modules/
+frontend/dist/
+app.log
+tasks.json
+config.json
+*.exe
+.DS_Store
+Thumbs.db

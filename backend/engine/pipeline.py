@@ -1,0 +1,3224 @@
+# -*- coding: utf-8 -*-
+# ==== pipeline.py ====
+# 职责：书籍下载处理流水线，协调元数据获取、下载、转换、OCR和书签
+# 入口函数：run_pipeline()
+# 依赖：config, task_store, ws_manager, engine.flaresolverr, engine.zlib_downloader, nlc.nlc_isbn
+# 注意：7步流水线，支持取消和错误处理
+
+import asyncio
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+from config import get_config
+from task_store import task_store, STATUS_COMPLETED, STATUS_RUNNING, STATUS_PAUSED, STATUS_CANCELLED, STATUS_FAILED
+from ws_manager import ws_manager
+PIPELINE_STEPS = [
+    "fetch_metadata",
+    "fetch_isbn",
+    "download_pages",
+    "convert_pdf",
+    "ocr",
+    "bookmark",
+    "finalize",
+]
+
+
+async def _emit(task_id: str, event_type: str, data: Dict[str, Any]):
+    await ws_manager.broadcast_task(task_id, {
+        "type": event_type,
+        "task_id": task_id,
+        **data,
+    })
+
+
+async def _emit_progress(task_id: str, step: str, progress: int, detail: str = "", eta: str = ""):
+    """Emit step_progress and persist to task_store atomically."""
+    await _emit(task_id, "step_progress", {
+        "step": step,
+        "progress": progress,
+        "detail": detail,
+        "eta": eta,
+    })
+    task_store.update(task_id, {
+        "step_detail": detail,
+        "step_eta": eta,
+        "progress": progress,
+    })
+
+
+async def _check_paused(task_id: str):
+    """Block while task is paused. Returns True if task was cancelled during pause."""
+    import asyncio as _asyncio
+    was_paused = False
+    while True:
+        t = task_store.get(task_id)
+        if not t:
+            return True
+        status = t.get("status")
+        if status == STATUS_CANCELLED:
+            return True
+        if status != STATUS_PAUSED:
+            return False
+        was_paused = True
+        await _asyncio.sleep(1)
+
+
+def _suspend_process(pid: int):
+    from platform_utils import suspend_process
+    return suspend_process(pid)
+
+
+def _resume_process(pid: int):
+    from platform_utils import resume_process
+    return resume_process(pid)
+
+
+def _kill_proc_tree(pid: int):
+    from platform_utils import kill_process_tree
+    kill_process_tree(pid)
+
+
+def _format_eta(remaining_seconds: float) -> str:
+    """Format remaining seconds into a human-readable ETA string."""
+    if remaining_seconds <= 0:
+        return ""
+    if remaining_seconds < 60:
+        return f"约{int(remaining_seconds)}秒"
+    minutes = int(remaining_seconds // 60)
+    seconds = int(remaining_seconds % 60)
+    if minutes < 60:
+        return f"约{minutes}分{seconds}秒"
+    hours = minutes // 60
+    minutes = minutes % 60
+    return f"约{hours}时{minutes}分"
+
+
+async def _run_ocrmypdf_with_progress(
+    task_id: str, cmd: List[str],
+    env: Optional[Dict[str, Optional[str]]] = None,
+    timeout: int = 7200,
+    total_pages: int = 0,
+    output_pdf: str = "",
+) -> int:
+    """Run ocrmypdf with real-time stderr progress parsing.
+    Reads stderr line by line, parses [page/total] and Page X of Y,
+    emits step_progress events with page count and ETA.
+    Returns the process exit code.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env={**{"PYTHONUNBUFFERED": "1"}, **{k: v for k, v in (env or os.environ).items() if v is not None}} if env else {"PYTHONUNBUFFERED": "1", **os.environ},
+    )
+    _start = time.time()
+    _cur = 0
+    _tot = 0
+    _last = 0
+    _had_output = False
+    _last_mtime = 0.0
+
+    def _count_output_pages() -> int:
+        """Try to open output PDF and count pages. Returns 0 if not accessible yet."""
+        if not output_pdf:
+            return 0
+        try:
+            import fitz as _fitz
+            _doc = _fitz.open(output_pdf)
+            _n = len(_doc)
+            _doc.close()
+            return _n
+        except Exception:
+            return 0
+
+    async def _monitor(p):
+        """Emit heartbeat progress while process is running."""
+        nonlocal _cur, _tot, _last, _last_mtime
+        _was_suspended = False
+        while p.returncode is None:
+            await asyncio.sleep(5)
+            if p.returncode is not None:
+                break
+            # Check if task was cancelled or paused
+            _t = task_store.get(task_id)
+            if _t and _t.get("status") == "cancelled":
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                break
+            if _t and _t.get("status") == "paused":
+                if not _was_suspended:
+                    _suspend_process(p.pid)
+                    _was_suspended = True
+                await asyncio.sleep(2)
+                continue
+            if _was_suspended and _t and _t.get("status") != "paused":
+                _was_suspended = False
+                _resume_process(p.pid)
+
+            _now = time.time()
+            _elapsed_sec = int(_now - _start)
+
+            if _cur == 0 or total_pages == 0:
+                # No page info available yet — fallback to heartbeat
+                _detail = f"处理中... {_elapsed_sec//60}分{_elapsed_sec%60}秒" if _elapsed_sec >= 60 else f"处理中... {_elapsed_sec}秒"
+                await _emit_progress(task_id, "ocr", 0, _detail, "")
+
+    _monitor_task = asyncio.create_task(_monitor(proc))
+
+    async def _reader(p) -> int:
+        nonlocal _cur, _tot, _last, _had_output
+        _last_output = time.time()
+        while True:
+            try:
+                _line = await asyncio.wait_for(p.stdout.readline(), timeout=10)
+            except asyncio.TimeoutError:
+                # No output within 10s. Check if process is already done.
+                if p.returncode is not None:
+                    break
+                # If task is paused, don't treat silence as completion — process is suspended
+                _t = task_store.get(task_id)
+                if _t and _t.get("status") == "paused":
+                    await asyncio.sleep(1)
+                    continue
+                # If all pages done and silent >30s, treat as done (pipe leaked by child process)
+                _idle = time.time() - _last_output
+                if _tot > 0 and _cur >= _tot and _idle > 30:
+                    task_store.add_log(task_id, "  OCR output silent after completion, treating as done")
+                    break
+                continue
+
+            if not _line:
+                # Process exited but pipe still open (Windows: leaked handle from subprocess)
+                if p.returncode is not None:
+                    task_store.add_log(task_id, "  OCR process exited, pipe drained")
+                    break
+                # Empty read but process still alive — brief pause then retry
+                await asyncio.sleep(1)
+                if p.returncode is not None:
+                    break
+                continue
+
+            _last_output = time.time()
+            _text = _line.decode(errors='replace').strip()
+            if not _text:
+                continue
+            _had_output = True
+
+            # Filter PaddleOCR harmless warnings
+            _skip_patterns = [
+                "No ccache found",
+                "warnings.warn",
+                "UserWarning",
+                "提供的模式无法找到文件",
+                "Model files already exist",
+                "To redownload, please delete",
+            ]
+            if any(p in _text for p in _skip_patterns):
+                continue
+
+            _m = re.search(r'\[(\d+)/(\d+)\]', _text)
+            if _m:
+                _cur = int(_m.group(1))
+                _tot = int(_m.group(2))
+            elif total_pages > 0:
+                _m0 = re.search(r'\[(\d+)\]', _text)
+                if _m0:
+                    _cur = int(_m0.group(1))
+                    _tot = total_pages
+                    if _cur % 1 == 0 or _cur == total_pages:
+                        task_store.add_log(task_id, f"  PaddleOCR: {_cur}/{_tot} 页")
+                    continue  # skip logging raw [N] line
+
+            task_store.add_log(task_id, f"  {_text[:200]}")
+
+            _m2 = re.search(r'[Pp]age\s+(\d+)\s+[oO]f\s+(\d+)', _text)
+            if _m2:
+                _cur = int(_m2.group(1))
+                _tot = int(_m2.group(2))
+
+            # Parse tesseract output like "46 [tesseract] lots of diacritics"
+            if total_pages > 0:
+                _m3 = re.match(r'\s*(\d+)\s+\[tesseract\]', _text)
+                if _m3:
+                    _cur = int(_m3.group(1))
+                    _tot = total_pages
+
+            _now = time.time()
+            if _tot > 0 and _cur > 0:
+                _pct = int(_cur / _tot * 100)
+                _elapsed = _now - _start
+                _eta = ""
+                if _cur > 1 and _elapsed > 5:
+                    _sec_pp = _elapsed / _cur
+                    _rem = (_tot - _cur) * _sec_pp
+                    _eta = _format_eta(_rem)
+                if _pct != _last or (_now - _start - max(_last if isinstance(_last, float) else 0, 0)) > 10:
+                    _last = _pct if _pct > 0 else _now
+                    await _emit_progress(task_id, "ocr", _pct, f"{_cur}/{_tot} 页", _eta)
+        try:
+            return await asyncio.wait_for(p.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            task_store.add_log(task_id, "  OCR process hanging after exit, sending kill")
+            _kill_proc_tree(p.pid)
+            try:
+                return await asyncio.wait_for(p.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                p.kill()
+                return p.returncode or 0
+
+    try:
+        return await asyncio.wait_for(_reader(proc), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise
+    finally:
+        _monitor_task.cancel()
+
+
+async def _enrich_external_metadata(task_id: str, report: Dict[str, Any], config: Dict[str, Any]) -> None:
+    """Re-fetch metadata from AA/Z-Lib to fill gaps (author, publisher, year, isbn).
+    Called from _step_fetch_metadata for books with empty book_id or missing ISBN."""
+    source = report.get("source", "")
+    md5 = report.get("book_id", "")
+    proxy = config.get("http_proxy", "")
+
+    if source == "annas_archive" and md5 and len(md5) == 32:
+        from api.search import _fetch_md5_page_info
+        try:
+            info = _fetch_md5_page_info(md5, proxy)
+            if info.get("title") and not report.get("title"):
+                report["title"] = info["title"]
+            for field in ("author", "isbn", "publisher", "year", "language"):
+                val = info.get(field, "")
+                if val and not report.get(field):
+                    report[field] = val
+            if isinstance(report.get("authors"), list) and not report["authors"]:
+                author_val = info.get("author", "")
+                if author_val:
+                    report["authors"] = [author_val]
+            if report.get("isbn"):
+                task_store.add_log(task_id, f"AA metadata enriched: isbn={report['isbn']}, author={report.get('authors')}")
+            else:
+                task_store.add_log(task_id, "AA metadata enriched (no ISBN found on MD5 page)")
+        except ImportError:
+            task_store.add_log(task_id, "AA enrichment skipped (search module not available)")
+        except Exception as e:
+            task_store.add_log(task_id, f"AA enrichment failed: {str(e)[:100]}")
+
+    elif source == "zlibrary" and md5:
+        try:
+            title = report.get("title", "")
+            isbn_val = report.get("isbn", "")
+            query = isbn_val or title
+            if query:
+                import asyncio as _aio
+                def _do_zlib_search():
+                    from engine.zlib_downloader import ZLibDownloader
+                    zl = ZLibDownloader(config)
+                    loop = _aio.new_event_loop()
+                    _aio.set_event_loop(loop)
+                    try:
+                        return loop.run_until_complete(zl.zlib_search(query, limit=3))
+                    finally:
+                        loop.close()
+                result = await _aio.to_thread(_do_zlib_search)
+                books = result.get("books") or result.get("results") or []
+                if isinstance(books, list) and books:
+                    best = books[0]
+                    for field in ("isbn", "author", "publisher", "year", "language"):
+                        val = best.get(field, "")
+                        if val and not report.get(field):
+                            report[field] = str(val) if field == "year" else val
+                    if not report.get("authors") and best.get("author"):
+                        report["authors"] = [str(best["author"])]
+                    task_store.add_log(task_id, f"Z-Lib metadata enriched: isbn={report.get('isbn')}")
+        except ImportError:
+            task_store.add_log(task_id, "Z-Lib enrichment skipped (zlib module not available)")
+        except Exception as e:
+            task_store.add_log(task_id, f"Z-Lib enrichment failed: {str(e)[:100]}")
+
+
+async def _step_fetch_metadata(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    task_store.add_log(task_id, "Step 1/7: Fetching metadata from database...")
+    await _emit(task_id, "step_progress", {"step": "fetch_metadata", "progress": 50})
+
+    book_id = task.get("book_id", "")
+    title = task.get("title", "")
+    source = task.get("source", "DX_6.0")
+
+    # If book_id is empty but ISBN is known, look up the local DB for the real book_id
+    isbn = task.get("isbn", "")
+    if not book_id and isbn:
+        try:
+            from search_engine import SearchEngine
+            se = SearchEngine()
+            se.set_db_dir(config.get("ebook_db_path", ""))
+            result = se.search(field="isbn", query=isbn, page=1, page_size=1)
+            books = result.get("books", [])
+            if books:
+                book_id = books[0].get("book_id", "")
+                if not book_id:
+                    book_id = books[0].get("id", "")
+                # Fill in missing metadata from DB
+                if not title:
+                    title = books[0].get("title", "")
+                source = books[0].get("source", source)
+                task_store.add_log(task_id, f"Found book in database: ID={book_id}")
+        except Exception as e:
+            task_store.add_log(task_id, f"Database lookup failed: {e}")
+
+    report = {
+        "book_id": book_id,
+        "title": title,
+        "source": source,
+        "ss_code": task.get("ss_code", ""),
+        "isbn": isbn,
+        "authors": task.get("authors", []),
+        "publisher": task.get("publisher", ""),
+    }
+
+    # For external-source books, re-fetch metadata from AA/Z-Lib to fill gaps
+    if source in ("annas_archive", "zlibrary") and (not isbn or not report.get("authors")):
+        await _enrich_external_metadata(task_id, report, config)
+        isbn = report.get("isbn", isbn)
+        title = report.get("title", title)
+
+    task_store.add_log(task_id, f"Book: {title} (ID: {book_id})")
+    await _emit(task_id, "step_progress", {"step": "fetch_metadata", "progress": 100})
+
+    return report
+
+
+async def _step_fetch_isbn(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Step 2/7: 获取图书元数据和书签
+
+    三种路径（根据输入类型自动选择）:
+      1. SS码模式: 直接用 SS码查 EbookDatabase（最准确）
+      2. 书名模式: 提取主标题 → fuzzy EbookDatabase
+      3. ISBN模式: 精确匹配 EbookDatabase → 未命中时 NLC fallback candidate
+
+    共享补全逻辑: EbookDatabase 为主 → NLC 补全(作者/出版社/年/内容提要) → 书葵网书签
+    """
+    task_store.add_log(task_id, "Step 2/7: Fetching book metadata & bookmark...")
+    await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 0})
+
+    ss_code = report.get("ss_code", "")
+    title = report.get("title", "")
+    isbn = report.get("isbn", "")
+    db_path = config.get("ebook_db_path", "")
+
+    book_from_db = None
+
+    # ═══════════════ Phase 1: 主搜索 ═══════════════
+
+    # Path A: SS码模式 — 优先，最准确
+    if ss_code and not book_from_db:
+        task_store.add_log(task_id, f"Path: SS code mode — searching by SS={ss_code}")
+        await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 20})
+        book_from_db = _search_db_by_ss(ss_code, db_path)
+        if book_from_db:
+            task_store.add_log(task_id, f"Found in DB via SS code: {book_from_db.get('title', '')}")
+            # Merge DB data into report
+            _merge_db_book(book_from_db, report)
+
+    # Path B: 书名模式 — 提取主标题后 fuzzy 搜索
+    if not book_from_db and title:
+        main_title = _extract_main_title(title)
+        if main_title != title:
+            task_store.add_log(task_id, f"Path: Title mode — main title: '{main_title}'")
+        else:
+            task_store.add_log(task_id, "Path: Title mode — searching DB by title")
+        await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 30})
+        book_from_db = _search_db_by_title(main_title, db_path)
+        if book_from_db:
+            task_store.add_log(task_id, f"Found in DB via title: {book_from_db.get('title', '')}")
+            _merge_db_book(book_from_db, report)
+        else:
+            task_store.add_log(task_id, f"No DB match for title '{main_title}', will use NLC")
+
+    # Path C: ISBN模式 — 精确匹配 EbookDatabase
+    if not book_from_db and isbn:
+        task_store.add_log(task_id, f"Path: ISBN mode — searching DB by ISBN={isbn}")
+        await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 40})
+        book_from_db = _search_db_by_isbn(isbn, db_path)
+        if book_from_db:
+            task_store.add_log(task_id, f"Found in DB via ISBN: {book_from_db.get('title', '')}")
+            _merge_db_book(book_from_db, report)
+        else:
+            task_store.add_log(task_id, f"No DB match for ISBN {isbn}, creating NLC fallback candidate")
+            # ISBN fallback: 标记 _fallback=True (无 SS码，步骤3只能走 AA MD5 搜索)
+            report["_fallback"] = True
+
+    # ═══════════════ Phase 2: NLC 补全 ═══════════════
+
+    await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 60})
+
+    # 如果有 ISBN 且缺少元数据，从 NLC 补全
+    if report.get("isbn"):
+        missing = []
+        if not report.get("authors"):
+            missing.append("authors")
+        if not report.get("publisher"):
+            missing.append("publisher")
+        if missing:
+            await _fetch_nlc_metadata(task_id, report, config)
+    elif report.get("title") and report.get("source", "") in ("annas_archive", "zlibrary"):
+        # External books without ISBN: try NLC title search for ISBN
+        if not report.get("authors") or not report.get("publisher"):
+            task_store.add_log(task_id, "NLC: attempting ISBN lookup by title (no ISBN in source data)")
+            await _fetch_nlc_metadata(task_id, report, config)
+
+    # ═══════════════ Phase 3: 书葵网书签 ═══════════════
+    await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 80})
+
+    # 从书葵网获取书签（优先级最高，通常含页码）
+    shukui_bookmark = ""
+    isbn_or_ss = report.get("isbn", "") or report.get("ss_code", "")
+    if isbn_or_ss:
+        try:
+            from addbookmark.bookmarkget import get_bookmark, get_bookmark_by_title
+            shukui_bookmark = await get_bookmark(isbn_or_ss)
+            if shukui_bookmark:
+                report["shukui_toc"] = shukui_bookmark
+                task_store.add_log(task_id, f"Shukui: bookmark fetched via ISBN/SS ({len(shukui_bookmark)} chars)")
+        except Exception as e:
+            task_store.add_log(task_id, f"Shukui bookmark error: {e}")
+
+    title_search = report.get("title", "")
+    if not shukui_bookmark and title_search:
+        try:
+            from addbookmark.bookmarkget import get_bookmark_by_title
+            shukui_bookmark = await get_bookmark_by_title(title_search)
+            if shukui_bookmark:
+                report["shukui_toc"] = shukui_bookmark
+                task_store.add_log(task_id, f"Shukui: bookmark fetched via title ({len(shukui_bookmark)} chars)")
+        except Exception as e:
+            task_store.add_log(task_id, f"Shukui title search error: {e}")
+
+    # 记录完成状态并回写到 task_store（只补全非空字段，不覆盖已有数据）
+    update_fields = {}
+    for key in ("title", "isbn", "publisher", "ss_code", "book_id"):
+        val = report.get(key)
+        if val:
+            update_fields[key] = val if isinstance(val, str) else str(val)
+    if report.get("authors"):
+        update_fields["authors"] = report.get("authors", [])
+    task_store.update(task_id, update_fields)
+
+    await _emit(task_id, "step_progress", {"step": "fetch_isbn", "progress": 100})
+
+    # Step 2.5: Enrich metadata from Douban and NLC TOC
+    isbn_val = report.get("isbn", "")
+    if isbn_val:
+        try:
+            from book_sources.douban import fetch_douban
+            loop = asyncio.get_running_loop()
+            douban_data = await loop.run_in_executor(None, fetch_douban, isbn_val)
+            if douban_data:
+                if douban_data.get("description"):
+                    report["description"] = douban_data["description"]
+                if douban_data.get("rating"):
+                    report["rating"] = douban_data["rating"]
+                if douban_data.get("tags"):
+                    report["tags"] = douban_data["tags"]
+                if douban_data.get("toc"):
+                    report["douban_toc"] = douban_data["toc"]
+                task_store.add_log(task_id, f"Douban: metadata enriched (rating={douban_data.get('rating', 'N/A')})")
+        except ImportError:
+            task_store.add_log(task_id, "Douban module not available")
+        except Exception as e:
+            task_store.add_log(task_id, f"Douban fetch error: {e}")
+
+        try:
+            from nlc.nlc_isbn import crawl_toc
+            nlc_toc = await crawl_toc(isbn_val)
+            if nlc_toc:
+                report["nlc_toc"] = nlc_toc
+                task_store.add_log(task_id, f"NLC: TOC extracted ({len(nlc_toc)} chars)")
+        except ImportError:
+            pass
+        except Exception as e:
+            task_store.add_log(task_id, f"NLC TOC error: {e}")
+
+        # Merge all TOC sources: shukui > douban > nlc
+        has_sources = report.get("shukui_toc") or report.get("douban_toc") or report.get("nlc_toc")
+        if has_sources:
+            try:
+                from addbookmark.bookmark_merger import merge_bookmarks
+                merged = merge_bookmarks(
+                    shukui=report.get("shukui_toc") or "",
+                    douban_toc=report.get("douban_toc") or "",
+                    nlc_toc=report.get("nlc_toc") or "",
+                )
+                if merged:
+                    # Keep original for reference
+                    report["raw_sources"] = {
+                        "shukui": bool(report.get("bookmark")),
+                        "douban": bool(report.get("douban_toc")),
+                        "nlc": bool(report.get("nlc_toc")),
+                    }
+                    report["bookmark"] = merged
+                    task_store.add_log(task_id, "Bookmark merger: unified TOC from all sources")
+            except ImportError:
+                pass
+            except Exception as e:
+                task_store.add_log(task_id, f"Bookmark merge error: {e}")
+    else:
+        # No ISBN — try title-based fallbacks for Douban and NLC TOC
+        title_val = report.get("title", "")
+        if title_val:
+            try:
+                from book_sources.douban import fetch_douban_by_title
+                loop = asyncio.get_running_loop()
+                douban_data = await loop.run_in_executor(None, fetch_douban_by_title, title_val)
+                if douban_data:
+                    if douban_data.get("description"):
+                        report["description"] = douban_data["description"]
+                    if douban_data.get("rating"):
+                        report["rating"] = douban_data["rating"]
+                    if douban_data.get("tags"):
+                        report["tags"] = douban_data["tags"]
+                    if douban_data.get("toc"):
+                        report["douban_toc"] = douban_data["toc"]
+                    task_store.add_log(task_id, f"Douban(title): metadata enriched (rating={douban_data.get('rating', 'N/A')})")
+            except ImportError:
+                pass
+            except Exception as e:
+                task_store.add_log(task_id, f"Douban(title) error: {e}")
+
+            try:
+                from nlc.nlc_isbn import crawl_toc_by_title
+                nlc_toc = await crawl_toc_by_title(title_val)
+                if nlc_toc:
+                    report["nlc_toc"] = nlc_toc
+                    task_store.add_log(task_id, f"NLC(title): TOC extracted ({len(nlc_toc)} chars)")
+            except ImportError:
+                pass
+            except Exception as e:
+                task_store.add_log(task_id, f"NLC(title) TOC error: {e}")
+
+            # Merge if any TOC found
+            if report.get("douban_toc") or report.get("nlc_toc"):
+                try:
+                    from addbookmark.bookmark_merger import merge_bookmarks
+                    merged = merge_bookmarks(
+                        shukui="",
+                        douban_toc=report.get("douban_toc") or "",
+                        nlc_toc=report.get("nlc_toc") or "",
+                    )
+                    if merged:
+                        report["raw_sources"] = {
+                            "shukui": False,
+                            "douban": bool(report.get("douban_toc")),
+                            "nlc": bool(report.get("nlc_toc")),
+                        }
+                        report["bookmark"] = merged
+                        task_store.add_log(task_id, "Bookmark merger: unified TOC from title-based sources")
+                except ImportError:
+                    pass
+                except Exception as e:
+                    task_store.add_log(task_id, f"Bookmark merge error: {e}")
+
+    return report
+
+
+# ═══════════════════════════ 辅助函数 ═══════════════════════════
+
+
+def _extract_main_title(title: str) -> str:
+    """
+    提取主标题，去除副标题分隔符。
+    分隔符: ：:  —— --- － ( ) （ ）【 】［ ］
+    """
+    import re
+    if not title:
+        return ""
+    # 常见副标题分隔符（从前往后分割）
+    for sep in ["：", ":", "　", "——", "---", "－", "—", "‧", "•"]:
+        idx = title.find(sep)
+        if idx > 0 and idx < len(title) - 1:
+            candidate = title[:idx].strip()
+            if len(candidate) >= 2:  # 主标题至少2字
+                return candidate
+    # 去掉括号内的副标题
+    title = re.sub(r'[（(][^）)]*[）)]', '', title).strip()
+    return title
+
+
+def _search_db_by_ss(ss_code: str, db_path: str) -> Optional[Dict[str, Any]]:
+    """通过 SS 码搜索 EbookDatabase"""
+    try:
+        from search_engine import SearchEngine
+        se = SearchEngine()
+        se.set_db_dir(db_path)
+        result = se.search(field="ss_code", query=ss_code, page=1, page_size=1)
+        books = result.get("books", [])
+        if books:
+            return books[0]
+    except Exception as e:
+        logger.warning(f"DB search by SS failed: {e}")
+    return None
+
+
+def _search_db_by_title(title: str, db_path: str) -> Optional[Dict[str, Any]]:
+    """通过书名 fuzzy 搜索 EbookDatabase"""
+    try:
+        from search_engine import SearchEngine
+        se = SearchEngine()
+        se.set_db_dir(db_path)
+        result = se.search(field="title", query=title, page=1, page_size=5)
+        books = result.get("books", [])
+        # 选标题最匹配的，相似度必须 >= 0.4 才采纳
+        if books:
+            best = books[0]
+            for book in books[1:]:
+                if _title_similarity(book.get("title", ""), title) > _title_similarity(best.get("title", ""), title):
+                    best = book
+            if _title_similarity(best.get("title", ""), title) < 0.4:
+                return None
+            return best
+    except Exception as e:
+        logger.warning(f"DB search by title failed: {e}")
+    return None
+
+
+def _search_db_by_isbn(isbn: str, db_path: str) -> Optional[Dict[str, Any]]:
+    """通过 ISBN 精确搜索 EbookDatabase"""
+    try:
+        from search_engine import SearchEngine
+        se = SearchEngine()
+        se.set_db_dir(db_path)
+        clean_isbn = isbn.replace("-", "").replace(" ", "")
+        result = se.search(field="isbn", query=clean_isbn, page=1, page_size=1)
+        books = result.get("books", [])
+        if books:
+            return books[0]
+        # Try partial match
+        result = se.search(field="isbn", query=isbn, page=1, page_size=3)
+        for b in result.get("books", []):
+            db_isbn = b.get("isbn", "").replace("-", "").replace(" ", "")
+            if clean_isbn == db_isbn or clean_isbn in db_isbn or db_isbn in clean_isbn:
+                return b
+    except Exception as e:
+        logger.warning(f"DB search by ISBN failed: {e}")
+    return None
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """标题相似度：子串匹配优先，否则字符重叠率。
+    子串匹配：如果一个标题包含另一个，返回高相似度。
+    """
+    if not a or not b:
+        return 0
+    al, bl = a.lower(), b.lower()
+    # 子串匹配：一个标题包含另一个 → 高相似度
+    if al in bl or bl in al:
+        return 0.9 - 0.2 * (abs(len(a) - len(b)) / max(len(a), len(b), 1))
+    # 字符重叠率（Jaccard）
+    a_chars = set(al)
+    b_chars = set(bl)
+    overlap = len(a_chars & b_chars)
+    return overlap / max(len(a_chars), len(b_chars), 1)
+
+
+def _merge_db_book(book: Dict[str, Any], report: Dict[str, Any]):
+    """将 EbookDatabase 的数据合并到 report 中，不覆盖已有值"""
+    fields = {
+        "book_id": ("book_id", "id"),
+        "title": ("title",),
+        "isbn": ("isbn",),
+        "ss_code": ("ss_code",),
+        "authors": ("author", "authors"),
+        "publisher": ("publisher",),
+    }
+    for report_key, db_keys in fields.items():
+        if report.get(report_key):
+            continue
+        for db_key in db_keys:
+            val = book.get(db_key, "")
+            if val:
+                if isinstance(val, str) and val.strip():
+                    report[report_key] = val.strip()
+                    break
+                elif not isinstance(val, str) and val:
+                    report[report_key] = val
+                    break
+
+    # second_pass_code 不是真实 MD5，不能给 stacks 使用
+    second_pass = book.get("second_pass_code", "")
+    if second_pass and not report.get("_second_pass_code"):
+        report["_second_pass_code"] = second_pass
+        logger.debug(f"Stored second_pass_code for {report.get('book_id', '?')}")
+
+
+async def _fetch_nlc_metadata(task_id: str, report: Dict[str, Any], config: Dict[str, Any]):
+    """从 NLC 国家图书馆补全作者/出版社/出版年/内容提要/主题词"""
+    isbn = report.get("isbn", "")
+    title = report.get("title", "")
+    if not isbn and not title:
+        return
+
+    task_store.add_log(task_id, f"NLC: fetching metadata for ISBN={isbn or '(search by title)'}")
+    try:
+        from backend.nlc.nlc_isbn import crawl_isbn
+
+        nlc_path = config.get("ebook_data_geter_path", "")
+        # Try title-based ISBN lookup when ISBN is missing
+        if nlc_path and not isbn and title:
+            fetched_isbn = await crawl_isbn(title, nlc_path)
+            if fetched_isbn:
+                report["isbn"] = fetched_isbn
+                isbn = fetched_isbn
+                task_store.add_log(task_id, f"NLC: ISBN discovered via title search: {fetched_isbn}")
+        elif nlc_path and isbn:
+            fetched_isbn = await crawl_isbn(title, nlc_path)
+            if fetched_isbn and not report.get("isbn"):
+                report["isbn"] = fetched_isbn
+                task_store.add_log(task_id, f"NLC: ISBN confirmed: {fetched_isbn}")
+
+        # NEW: get author/publisher/year from NLC OPAC by ISBN
+        current_isbn = report.get("isbn", "")
+        if current_isbn:
+            try:
+                from backend.nlc.nlc_isbn import crawl_metadata
+                meta = await crawl_metadata(current_isbn)
+                if meta:
+                    if not report.get("authors") and meta.get("author"):
+                        report["authors"] = [meta["author"]]
+                        task_store.add_log(task_id, f"NLC: author found: {meta['author']}")
+                    if not report.get("publisher") and meta.get("publisher"):
+                        report["publisher"] = meta["publisher"]
+                        task_store.add_log(task_id, f"NLC: publisher found: {meta['publisher']}")
+                    if not report.get("year") and meta.get("year"):
+                        report["year"] = meta["year"]
+                        task_store.add_log(task_id, f"NLC: year found: {meta['year']}")
+            except ImportError:
+                task_store.add_log(task_id, "NLC metadata: module not available")
+            except Exception as e:
+                task_store.add_log(task_id, f"NLC metadata: error: {str(e)[:100]}")
+    except ImportError:
+        task_store.add_log(task_id, "NLC: module not available")
+    except Exception as e:
+        task_store.add_log(task_id, f"NLC: error: {str(e)[:100]}")
+
+
+async def _get_page_with_flare(url: str, proxy: str = "", timeout: int = 30) -> Optional[str]:
+    """Fetch a web page, trying FlareSolverr first (for Cloudflare bypass), then direct."""
+    try:
+        from engine.flaresolverr import get_page_content
+        result = await get_page_content(url, proxy)
+        if result:
+            return result
+    except ImportError:
+        pass
+    # Direct fallback
+    import requests as _req
+    try:
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        kwargs = {"timeout": timeout, "headers": h, "verify": False}
+        if proxy:
+            kwargs["proxies"] = {"http": proxy, "https": proxy}
+        r = _req.get(url, **kwargs)
+        return r.text if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+async def _download_via_aa_and_stacks(
+    task_id: str, config: Dict[str, Any], report: Dict[str, Any],
+    ss_code: str, isbn: str, title: str, proxy: str,
+) -> Optional[str]:
+    """
+    Anna's Archive 搜索 → 提取MD5 → stacks下载 → 直接兜底
+    返回下载文件路径，失败返回None
+    """
+    tmp_dir = report.get("tmp_dir", "")
+    if not tmp_dir:
+        return None
+
+    # Step A: 搜索 AA 获取所有 MD5 条目
+    search_queries = []
+    if ss_code:
+        search_queries.append(("SS", ss_code))
+    if isbn:
+        search_queries.append(("ISBN", isbn))
+    if title and not search_queries:
+        search_queries.append(("title", title))
+
+    from engine.aa_downloader import search_aa, get_md5_details, batch_get_md5_details, get_stacks_api_key, _calc_title_relevance, verify_md5, resolve_download_url
+
+    all_md5_entries = []
+    for qtype, qval in search_queries:
+        task_store.add_log(task_id, f"AA: searching by {qtype}={qval}")
+        entries = await search_aa(qval, proxy)
+        if entries:
+            task_store.add_log(task_id, f"AA: found {len(entries)} MD5 entries via {qtype}")
+            all_md5_entries.extend(entries)
+            if len(all_md5_entries) >= 5:
+                break
+        await asyncio.sleep(1)
+
+    if not all_md5_entries:
+        task_store.add_log(task_id, "AA: no MD5 entries found for any search query")
+        return None
+
+    # 去重（按MD5）
+    seen = set()
+    deduped = []
+    for e in all_md5_entries:
+        if e["md5"] not in seen:
+            seen.add(e["md5"])
+            deduped.append(e)
+    all_md5_entries = deduped
+    task_store.add_log(task_id, f"AA: {len(all_md5_entries)} unique MD5 entries to try")
+
+    # Step B: 尝试 stacks 下载（优先 — 仅当 Docker 服务运行）
+    # （stacks 是 Anna's Archive 下载管理器，与 FlareSolverr 不同）
+    stacks_api_key = config.get("stacks_api_key", "") or get_stacks_api_key()
+    stacks_url = config.get("stacks_base_url", "http://localhost:7788")
+    stacks_timeout = config.get("stacks_timeout", 300)
+    use_stacks = bool(stacks_api_key)
+
+    # 即使没有 API key，也尝试检测 stacks 是否运行
+    if not use_stacks:
+        try:
+            import requests as _req
+            hc = _req.get(f"{stacks_url}/api/health", timeout=3)
+            if hc.status_code < 500:
+                use_stacks = True
+                task_store.add_log(task_id, f"AA: stacks detected at {stacks_url} (no API key, limited endpoints)")
+        except Exception:
+            task_store.add_log(task_id, f"AA: stacks not reachable at {stacks_url} — will fall back to FlareSolverr+CDN")
+
+    if use_stacks:
+        task_store.add_log(task_id, f"AA: stacks {'configured' if stacks_api_key else 'reachable'} ({stacks_url})")
+
+        import requests as _req
+
+        # Session-based auth: login with username/password, fallback to API key headers
+        stacks_session = None
+        stacks_username = config.get("stacks_username", "")
+        stacks_password = config.get("stacks_password", "")
+
+        # Try cached session first (from auto-login on startup)
+        if not stacks_session and stacks_username:
+            from config import get_stacks_cached_session
+            cached = get_stacks_cached_session()
+            if cached:
+                stacks_session = cached
+                task_store.add_log(task_id, f"AA: using cached stacks session")
+
+        if not stacks_session and stacks_username and stacks_password:
+            try:
+                lr = _req.post(f"{stacks_url}/login",
+                               json={"username": stacks_username, "password": stacks_password},
+                               timeout=5)
+                if lr.status_code == 200:
+                    stacks_session = lr.cookies.get("session")
+                    if stacks_session:
+                        task_store.add_log(task_id, f"AA: stacks login OK (user: {stacks_username})")
+                        from config import set_stacks_cached_session
+                        set_stacks_cached_session(stacks_session)
+                else:
+                    task_store.add_log(task_id, f"AA: stacks login failed ({lr.status_code})")
+            except Exception as e:
+                task_store.add_log(task_id, f"AA: stacks login error: {e}")
+
+        # Step C: 批量获取所有 MD5 详情（并行），然后遍历
+        md5_list = [e["md5"] for e in all_md5_entries[:10]]
+        task_store.add_log(task_id, f"AA: fetching details for {len(md5_list)} MD5 entries in parallel...")
+        details_list = await batch_get_md5_details(md5_list, proxy)
+        details_by_md5 = {d["md5"]: d for d in details_list}
+
+        for i, entry in enumerate(all_md5_entries[:10]):
+            md5 = entry["md5"]
+            task_store.add_log(task_id, f"AA [{i+1}/{min(len(all_md5_entries), 10)}]: trying MD5={md5}")
+
+            # 获取 MD5 详情（zlib_id, title, isbn 等）
+            details = details_by_md5.get(md5, {"md5": md5})
+            filesize_bytes = details.get("filesize_bytes", entry.get("size_bytes", 0))
+            md5_title = details.get("title", "")
+
+            # 匹配 MD5 详情中的标题/ISBN 与 Step1 元数据
+            if title or isbn:
+                skip = False
+                if md5_title and title:
+                    rel_score = _calc_title_relevance(md5_title, title)
+                    if rel_score < 30:
+                        task_store.add_log(task_id, f"AA: MD5 {md5} title mismatch ('{md5_title[:30]}' vs '{title[:30]}', score={rel_score}), skipping")
+                        skip = True
+                if not skip and isbn and details.get("isbn"):
+                    if isbn.replace("-", "") != details["isbn"].replace("-", ""):
+                        task_store.add_log(task_id, f"AA: MD5 {md5} ISBN mismatch ({details['isbn']} vs {isbn}), skipping")
+                        skip = True
+                if skip:
+                    continue
+                if md5_title:
+                    task_store.add_log(task_id, f"AA: MD5 {md5} title matched ('{md5_title[:30]}')")
+
+            # 唯一下载路径: stacks（参考代码做法—不用直连/FlareSolverr）
+            # stacks 不可用或失败时直接返回 None，走 ZL 降级
+            if use_stacks:
+                try:
+                    import requests as _req
+
+                    # ── API headers helper ──
+                    def _bearer():
+                        if stacks_session:
+                            return {"Cookie": f"session={stacks_session}"}
+                        return {"Authorization": f"Bearer {stacks_api_key}"} if stacks_api_key else {}
+
+                    def _xkey():
+                        h = {"Content-Type": "application/json"}
+                        if stacks_session:
+                            h["Cookie"] = f"session={stacks_session}"
+                        elif stacks_api_key:
+                            h["X-API-Key"] = str(stacks_api_key)
+                        return h
+
+                    # ── 复制到目标目录 ──
+                    def _copy_dest(found_path: str, dl_dir: str) -> str:
+                        if dl_dir:
+                            fname = os.path.basename(found_path)
+                            dest = os.path.join(dl_dir, fname)
+                            shutil.copy2(found_path, dest)
+                            return dest
+                        return found_path
+
+                    # ── 查找 stacks 下载的文件 ──
+                    def _find_stacks_file(fname: str, dl_dir: str = "", extra_paths: Optional[List[str]] = None) -> Optional[str]:
+                        ssid = fname.split(".")[0] if "." in fname else ""
+                        bases = [Path.home()/"stacks"/"stacks"/"download",
+                                 Path.home()/"stacks"/"download"]
+                        if dl_dir:
+                            bases.append(Path(dl_dir))
+                        if extra_paths:
+                            for p in extra_paths:
+                                if p:
+                                    bases.append(Path(p))
+                        task_store.add_log(task_id, f"AA: _find_stacks_file(fname={fname}, ssid={ssid}) searching {len(bases)} paths...")
+                        for base in bases:
+                            task_store.add_log(task_id, f"AA:   checking base={base}")
+                            # 1. Exact match
+                            cand = base / fname
+                            if cand.exists():
+                                sz = cand.stat().st_size
+                                task_store.add_log(task_id, f"AA:   exact match {cand} (size={sz})")
+                                if sz > 1024:
+                                    return str(cand)
+                                task_store.add_log(task_id, f"AA:   exact match too small ({sz}), skipping")
+                            else:
+                                task_store.add_log(task_id, f"AA:   no exact match at {cand}")
+                            # 2. SSID prefix match
+                            if ssid:
+                                for glob_pat in (f"{ssid}_*.*", f"{ssid}.*"):
+                                    matches = list(base.glob(glob_pat))
+                                    task_store.add_log(task_id, f"AA:   glob {glob_pat} → {len(matches)} matches")
+                                    for p in matches:
+                                        sz = p.stat().st_size
+                                        task_store.add_log(task_id, f"AA:     candidate {p} (size={sz})")
+                                        if sz > 1024:
+                                            return str(p)
+                        task_store.add_log(task_id, "AA:   _find_stacks_file: NOT FOUND in any path")
+                        return None
+
+# ── docker cp 兜底 ──
+                    def _docker_cp_stacks(container_path: str) -> Optional[str]:
+                        try:
+                            r = subprocess.run(["docker", "ps", "--filter", "name=stacks", "--format", "{{.Names}}"],
+                                               capture_output=True, text=True, timeout=5)
+                            cname = r.stdout.strip()
+                            if not cname:
+                                return None
+                            fname = os.path.basename(container_path)
+                            local = Path.home() / "stacks" / fname
+                            cp = subprocess.run(["docker", "cp", f"{cname}:{container_path}", str(local)],
+                                                capture_output=True, timeout=15)
+                            if cp.returncode == 0 and local.exists() and local.stat().st_size > 1024:
+                                return str(local)
+                        except Exception:
+                            pass
+                        return None
+
+                    # ── 核心：同步下载 + 心跳检测 ──
+                    def _stacks_sync_download(md5: str, dl_dir: str, ss_code: str = "",
+                                               progress_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+                        url = stacks_url.rstrip("/")
+                        key = str(stacks_api_key or "")
+                        seen_fps = set()
+                        extra_search_paths: List[str] = []
+                        if progress_data is None:
+                            progress_data = {}
+
+                        # Step 0: 从 stacks API 获取实际下载路径
+                        try:
+                            cr = _req.get(f"{url}/api/config", headers=_bearer(), timeout=5)
+                            if cr.status_code == 200:
+                                cfg = cr.json()
+                                # 尝试所有可能的 key
+                                for cfg_key in ("download_directory", "download_path", "dl_path",
+                                                "downloadDir", "download_dir", "stacks_download"):
+                                    raw = cfg.get(cfg_key, "")
+                                    if raw:
+                                        p = str(raw).strip()
+                                        if p and os.path.isdir(p):
+                                            extra_search_paths.append(p)
+                                            task_store.add_log(task_id, f"AA: stacks config [{cfg_key}]={p} → added to search paths")
+                                            break
+                                else:
+                                    task_store.add_log(task_id, f"AA: stacks config response keys: {list(cfg.keys())[:10]}")
+                        except Exception as e:
+                            task_store.add_log(task_id, f"AA: could not get stacks config: {e}")
+
+                        # 如果 API 没返回路径，尝试常用默认路径
+                        if not extra_search_paths:
+                            for guess in ("D:\\stacks-data\\download",
+                                          os.path.expandvars(r"%USERPROFILE%\stacks\download")):
+                                if os.path.isdir(guess):
+                                    extra_search_paths.append(guess)
+                                    task_store.add_log(task_id, f"AA: using default search path: {guess}")
+                                    break
+                        # 始终把 download_dir 加入搜索
+                        if dl_dir and dl_dir not in extra_search_paths:
+                            extra_search_paths.append(dl_dir)
+
+                        task_store.add_log(task_id, f"AA: extra search paths: {extra_search_paths}")
+
+                        # ★Step 1.5: 提交前先检查磁盘上是否已有文件（按 SSID）
+                        if ss_code:
+                            task_store.add_log(task_id, f"AA: checking disk for existing file by SSID={ss_code}...")
+                            # 构造可能的文件名
+                            for ext in (".zip", ".pdf", ".epub", ".mobi", ".rar", ".tar"):
+                                found = _find_stacks_file(f"{ss_code}{ext}", "", extra_search_paths)
+                                if found:
+                                    dest = _copy_dest(found, dl_dir)
+                                    task_store.add_log(task_id, f"AA: existing file found by SSID → {dest}")
+                                    return dest
+                                # 也检查 SSID_xxx 模式
+                                for base_str in extra_search_paths:
+                                    base = Path(base_str)
+                                    for p in base.glob(f"{ss_code}_*{ext}"):
+                                        if p.stat().st_size > 1024:
+                                            dest = _copy_dest(str(p), dl_dir)
+                                            task_store.add_log(task_id, f"AA: existing file found (named) → {dest}")
+                                            return dest
+
+                        # Step 1: 检查 recent_history 中是否已有下载完成的文件
+                        try:
+                            sr = _req.get(f"{url}/api/status", headers=_bearer(), timeout=5)
+                            if sr.status_code == 200:
+                                sd = sr.json()
+                                for item in sd.get("recent_history", []):
+                                    if not isinstance(item, dict):
+                                        continue
+                                    fp = item.get("filepath", "")
+                                    if not fp:
+                                        continue
+                                    task_store.add_log(task_id, f"AA: history item filepath={fp}")
+                                    seen_fps.add(fp)
+                                    fname = os.path.basename(fp)
+                                    hist_ssid = fname.split(".")[0] if "." in fname else fname
+                                    if not ss_code:
+                                        task_store.add_log(task_id, f"AA:   no SS code, skip history (SSID={hist_ssid} unverifiable)")
+                                        continue
+                                    if hist_ssid != ss_code:
+                                        task_store.add_log(task_id, f"AA:   history SSID={hist_ssid} ≠ target SSID={ss_code}, skip")
+                                        continue
+                                    found = _find_stacks_file(fname, "", extra_search_paths)
+                                    if found:
+                                        dest = _copy_dest(found, dl_dir)
+                                        task_store.add_log(task_id, f"AA: found in history → {dest}")
+                                        return dest
+                                    task_store.add_log(task_id, "AA: trying docker cp for history file...")
+                                    found = _docker_cp_stacks(fp)
+                                    if found:
+                                        dest = _copy_dest(found, dl_dir)
+                                        task_store.add_log(task_id, f"AA: docker cp for history → {dest}")
+                                        return dest
+                                    task_store.add_log(task_id, "AA: history file not found on disk, clearing history & retrying...")
+                                    try:
+                                        _req.post(f"{url}/api/history/clear", headers=_xkey(), timeout=5)
+                                    except Exception as e:
+                                        task_store.add_log(task_id, f"AA: history clear error: {e}")
+                                    break
+                        except Exception as e:
+                            task_store.add_log(task_id, f"AA: history check error: {str(e)[:100]}")
+
+                        # Step 2: add_task — 先清历史，再添加（避免 MD5 已存在冲突）
+                        try:
+                            _req.post(f"{url}/api/history/clear", headers=_xkey(), timeout=5)
+                        except Exception:
+                            pass
+                        add_ok = False
+                        for attempt in range(3):
+                            task_store.add_log(task_id, f"AA: add_task MD5={md5} attempt {attempt+1}/3...")
+                            try:
+                                ar = _req.post(f"{url}/api/queue/add",
+                                               json={"md5": md5, "source": "manual"},
+                                               headers=_xkey(), timeout=10)
+                                if ar.status_code == 200:
+                                    try:
+                                        resp = ar.json()
+                                        if resp.get("success") is False or "already" in resp.get("message", "").lower():
+                                            task_store.add_log(task_id, f"AA: stacks declined to add task: {resp.get('message', '')[:100]}")
+                                            add_ok = False
+                                            break
+                                    except Exception:
+                                        pass
+                                    add_ok = True
+                                    task_store.add_log(task_id, "AA: MD5 added to queue")
+                                    break
+                                resp_text = ar.text[:200]
+                                task_store.add_log(task_id, f"AA: add_task returned {ar.status_code}: {resp_text}")
+                                # 已存在→清历史→重试
+                                if "already" in resp_text.lower() or ar.status_code in (400, 409):
+                                    task_store.add_log(task_id, "AA: task already exists, clearing history & retrying...")
+                                    try:
+                                        _req.post(f"{url}/api/history/clear", headers=_xkey(), timeout=5)
+                                    except Exception as e2:
+                                        task_store.add_log(task_id, f"AA: history clear error: {e2}")
+                                    continue
+                            except Exception as e:
+                                task_store.add_log(task_id, f"AA: add_task error: {e}")
+                                continue
+                            break  # 非冲突错误不再重试
+
+                        if not add_ok:
+                            task_store.add_log(task_id, "AA: failed to add MD5 to stacks queue after 3 attempts")
+                            return None
+
+                        # Step 3: 心跳轮询（每3秒检测一次，直到下载完成）
+                        task_store.add_log(task_id, "AA: heartbeat polling for stacks download...")
+                        start_time = time.time()
+                        _hb_timeout = 600  # 10 min global timeout for heartbeat
+                        while True:
+                            _elapsed_hb = time.time() - start_time
+                            if _elapsed_hb > _hb_timeout:
+                                task_store.add_log(task_id, f"AA: heartbeat timeout ({int(_elapsed_hb)}s), giving up on this MD5")
+                                return None
+                            dl_info = None
+                            try:
+                                sr = _req.get(f"{url}/api/status", headers=_bearer(), timeout=5)
+                                if sr.status_code == 200:
+                                    sd = sr.json()
+
+                                    # 3a. 检查 queue 中是否有 completed 条目
+                                    for item in sd.get("queue", []):
+                                        if isinstance(item, dict) and item.get("completed_at") and item.get("filepath"):
+                                            fp = item["filepath"]
+                                            if fp in seen_fps:
+                                                continue
+                                            seen_fps.add(fp)
+                                            task_store.add_log(task_id, f"AA: queue completed → {fp}")
+                                            fname = os.path.basename(fp)
+                                            found = _find_stacks_file(fname, "", extra_search_paths)
+                                            if found:
+                                                dest = _copy_dest(found, dl_dir)
+                                                task_store.add_log(task_id, f"AA: stacks OK → {fname}")
+                                                return dest
+                                            found = _docker_cp_stacks(fp)
+                                            if found:
+                                                dest = _copy_dest(found, dl_dir)
+                                                task_store.add_log(task_id, f"AA: docker cp OK → {fname}")
+                                                return dest
+                                            task_store.add_log(task_id, "AA: queue completed but file not found, clearing history & re-adding task...")
+                                            try:
+                                                _req.post(f"{url}/api/history/clear", headers=_xkey(), timeout=5)
+                                            except Exception:
+                                                pass
+                                            for _ in range(2):
+                                                try:
+                                                    ar2 = _req.post(f"{url}/api/queue/add", json={"md5": md5, "source": "manual"}, headers=_xkey(), timeout=10)
+                                                    if ar2.status_code == 200:
+                                                        try:
+                                                            r2 = ar2.json()
+                                                            if r2.get("success") is False and "already" in r2.get("message", "").lower():
+                                                                task_store.add_log(task_id, f"AA: stacks declined re-add: {r2.get('message', '')[:80]}")
+                                                                return None
+                                                        except Exception:
+                                                            pass
+                                                        task_store.add_log(task_id, "AA: task re-added, restarting heartbeat...")
+                                                        seen_fps.clear()
+                                                        break
+                                                except Exception:
+                                                    continue
+                                            continue
+
+                                    # 3b. 检查 recent_history 中新完成的条目
+                                    for item in sd.get("recent_history", []):
+                                        if isinstance(item, dict) and item.get("completed_at") and item.get("filepath"):
+                                            fp = item["filepath"]
+                                            if fp in seen_fps:
+                                                continue
+                                            seen_fps.add(fp)
+                                            task_store.add_log(task_id, f"AA: recent_history completed → {fp}")
+                                            fname = os.path.basename(fp)
+                                            hist_ssid = fname.split(".")[0] if "." in fname else fname
+                                            if not ss_code:
+                                                ext = os.path.splitext(fname)[1].lower() if "." in fname else ""
+                                                if ext and ext != ".pdf":
+                                                    task_store.add_log(task_id, f"AA: 下载格式不是 PDF ({ext}), 任务终止 — 请在 Anna's Archive 网页手动下载")
+                                                    task_store.update(task_id, {"status": STATUS_FAILED, "error": f"AA 下载格式为 {ext}，非 PDF，请在 Anna's Archive 网页手动下载 PDF 格式"})
+                                                    return None
+                                                task_store.add_log(task_id, f"AA: no SS code, skip history (SSID={hist_ssid} unverifiable)")
+                                                continue
+                                            if hist_ssid != ss_code:
+                                                task_store.add_log(task_id, f"AA:   history SSID={hist_ssid} ≠ target SSID={ss_code}, skip")
+                                                continue
+                                            found = _find_stacks_file(fname, "", extra_search_paths)
+                                            if found:
+                                                dest = _copy_dest(found, dl_dir)
+                                                task_store.add_log(task_id, f"AA: stacks OK → {fname}")
+                                                return dest
+                                            found = _docker_cp_stacks(fp)
+                                            if found:
+                                                dest = _copy_dest(found, dl_dir)
+                                                task_store.add_log(task_id, f"AA: docker cp OK → {fname}")
+                                                return dest
+                                            task_store.add_log(task_id, f"AA: recent_history completed item {fp} but file not found, clearing history & re-adding task...")
+                                            try:
+                                                _req.post(f"{url}/api/history/clear", headers=_xkey(), timeout=5)
+                                            except Exception as e:
+                                                task_store.add_log(task_id, f"AA: history clear error: {e}")
+                                            for _ in range(2):
+                                                try:
+                                                    ar3 = _req.post(f"{url}/api/queue/add", json={"md5": md5, "source": "manual"}, headers=_xkey(), timeout=10)
+                                                    if ar3.status_code == 200:
+                                                        try:
+                                                            r3 = ar3.json()
+                                                            if r3.get("success") is False and "already" in r3.get("message", "").lower():
+                                                                task_store.add_log(task_id, f"AA: stacks declined re-add: {r3.get('message', '')[:80]}")
+                                                                return None
+                                                        except Exception:
+                                                            pass
+                                                        task_store.add_log(task_id, "AA: task re-added, restarting heartbeat...")
+                                                        seen_fps.clear()
+                                                        break
+                                                except Exception:
+                                                    continue
+                                            continue
+
+                                    # 3c. 检测当前下载进度
+                                    active_items = sd.get("current_downloads", []) or []
+                                    cur = sd.get("current")
+                                    if cur and isinstance(cur, dict) and cur.get("md5") == md5:
+                                        active_items = [cur]
+                                    dl_info = None
+                                    for item in active_items:
+                                        if isinstance(item, dict) and item.get("md5") == md5 and not item.get("completed_at"):
+                                            dl_info = item
+                                            break
+                                    if dl_info:
+                                        progress = dl_info.get("progress", {})
+                                        if isinstance(progress, dict):
+                                            pct_val = progress.get("percent", 0)
+                                            speed_bps = progress.get("speed", 0)
+                                            downloaded = progress.get("downloaded", 0)
+                                            total_size = progress.get("total_size", 0)
+                                            speed_str = f"{speed_bps / 1024:.0f} KB/s" if speed_bps > 0 else ""
+                                            if progress_data is not None:
+                                                progress_data["progress"] = pct_val
+                                                progress_data["detail"] = f"stacks {pct_val:.0f}% {speed_str}"
+                                                if speed_bps > 0 and total_size > downloaded:
+                                                    eta_s = (total_size - downloaded) / speed_bps
+                                                    progress_data["eta"] = _format_eta(int(eta_s))
+                                        remaining = int(time.time() - start_time)
+                                        if remaining % 6 == 0:
+                                            elapsed_s = int(time.time() - start_time)
+                                            status_msg = dl_info.get("status_message", "downloading")
+                                            task_store.add_log(task_id, f"AA: stacks {status_msg} ({pct_val:.0f}%, {speed_str}) ({elapsed_s}s)")
+                                    else:
+                                        remaining = int(time.time() - start_time)
+                                        if remaining % 15 == 0:
+                                            elapsed_s = int(time.time() - start_time)
+                                            task_store.add_log(task_id, f"AA: stacks heartbeat ({elapsed_s}s)...")
+                            except Exception as e:
+                                task_store.add_log(task_id, f"AA: heartbeat error: {str(e)[:100]}")
+
+                            # Fallback progress when no real download data
+                            if progress_data is not None and not dl_info:
+                                elapsed = max(time.time() - start_time, 1)
+                                progress_data["detail"] = f"AA stacks 等待中... ({int(elapsed)}s)"
+                                progress_data["eta"] = ""
+
+                            time.sleep(3)  # 心跳间隔
+                            # Check if user cancelled
+                            _t = task_store.get(task_id)
+                            if _t and _t.get("status") == "cancelled":
+                                task_store.add_log(task_id, "AA: download cancelled by user")
+                                return None
+
+                        task_store.add_log(task_id, "AA: stacks heartbeat ended")
+                        return None
+
+                    download_dir = config.get("download_dir", "")
+                    ss_code_local = report.get("ss_code", "")
+                    # Set up shared progress tracking
+                    _progress: Dict[str, Any] = {}
+
+                    # Start stacks download in executor
+                    _future = asyncio.get_event_loop().run_in_executor(
+                        None, _stacks_sync_download, md5, download_dir, ss_code_local, _progress)
+
+                    # Poll progress every 3 seconds while waiting
+                    while not _future.done():
+                        await asyncio.sleep(3)
+                        if _progress:
+                            await _emit_progress(
+                                task_id, "download_pages",
+                                _progress.get("progress", 50),
+                                _progress.get("detail", ""),
+                                _progress.get("eta", ""),
+                            )
+
+                    stack_result = await _future
+                    if stack_result:
+                        ss_code = report.get("ss_code", "")
+                        safe_title = re.sub(r'[<>:"/\\|?*]', '_', report.get("title", "book")).strip()[:80]
+                        ext = os.path.splitext(stack_result)[1] or ".pdf"
+                        # 通过 magic bytes 检测真实文件类型（stacks 可能把 PDF 命名为 .zip）
+                        if ext.lower() in (".zip", ".rar", ".tar", ".7z"):
+                            try:
+                                with open(stack_result, "rb") as _fh:
+                                    magic = _fh.read(8)
+                                if magic[:4] == b"%PDF":
+                                    ext = ".pdf"
+                                    task_store.add_log(task_id, f"AA: detected PDF content (magic bytes), correcting ext from .zip → .pdf")
+                                elif magic[:4] == b"\x89PNG":
+                                    ext = ".png"
+                                elif magic[:2] in (b"\xff\xd8",):
+                                    ext = ".jpg"
+                            except Exception:
+                                pass
+                        dest = os.path.join(download_dir, f"{ss_code}_{safe_title}{ext}" if ss_code else f"{safe_title}{ext}")
+                        if os.path.abspath(stack_result) != os.path.abspath(dest):
+                            shutil.copy2(stack_result, dest)
+                            task_store.add_log(task_id, f"AA: copied to download dir: {dest}")
+                            return dest
+                        return stack_result
+                    else:
+                        task_store.add_log(task_id, "AA: stacks download did not produce a file")
+                except ImportError:
+                    task_store.add_log(task_id, "AA: stacks_client module not available")
+                except Exception as e:
+                    task_store.add_log(task_id, f"AA: stacks error: {str(e)[:100]}")
+
+        # stacks 不可用或失败 → FlareSolverr 兜底下载
+        # 通过 FlareSolverr session 获取 /d/{md5} 的 CDN 重定向 URL
+        try:
+            from engine.flaresolverr import _get_flare_port
+            port = _get_flare_port(config)
+            task_store.add_log(task_id, f"AA: trying FlareSolverr direct download (port {port})...")
+            fs_url = await resolve_download_url(md5, proxy)
+            if fs_url and "annas-archive" not in fs_url.lower():
+                task_store.add_log(task_id, f"AA: CDN URL from FlareSolverr: {fs_url[:80]}")
+                import requests as _req
+                hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                fs_resp = _req.get(fs_url, headers=hdrs, timeout=120, verify=False, stream=True)
+                if fs_resp.status_code == 200:
+                    _total_size = int(fs_resp.headers.get("Content-Length", 0))
+                    _downloaded = 0
+                    _dl_start = time.time()
+                    cd = fs_resp.headers.get("Content-Disposition", "")
+                    fname = f"{md5}.pdf"
+                    if cd and "filename=" in cd:
+                        fname = cd.split("filename=")[-1].strip("\"' ")
+                    fpath = os.path.join(tmp_dir, fname)
+                    with open(fpath, "wb") as f:
+                        for chunk in fs_resp.iter_content(65536):
+                            if chunk:
+                                f.write(chunk)
+                                _downloaded += len(chunk)
+                                if _total_size > 0 and _downloaded % (65536 * 100) == 0:
+                                    _pct = int(_downloaded / _total_size * 100)
+                                    _elapsed = time.time() - _dl_start
+                                    _speed = _downloaded / _elapsed / 1024 / 1024 if _elapsed > 0 else 0
+                                    _remaining = (_total_size - _downloaded) / (_downloaded / _elapsed) if _downloaded > 0 else 0
+                                    await _emit_progress(
+                                        task_id, "download_pages",
+                                        _pct,
+                                        f"AA 下载中... {_downloaded//1024//1024}MB/{_total_size//1024//1024}MB ({_speed:.1f} MB/s)",
+                                        _format_eta(_remaining),
+                                    )
+                    if os.path.getsize(fpath) > 1024:
+                        with open(fpath, "rb") as fh:
+                            if fh.read(4) == b"%PDF" and verify_md5(fpath, md5):
+                                task_store.add_log(task_id, f"AA: FlareSolverr download OK")
+                                return fpath
+                        os.remove(fpath)
+        except Exception as e:
+            task_store.add_log(task_id, f"AA: FlareSolverr download failed: {str(e)[:100]}")
+
+        return None
+
+
+async def _download_via_libgen(
+    task_id: str, report: Dict[str, Any], config: Dict[str, Any],
+    title: str, isbn: str, authors: List[str], proxy: str,
+) -> Optional[str]:
+    """LibGen 兜底下载（所有其他方式失败后的最后选择）"""
+    task_store.add_log(task_id, "LibGen: trying as last resort...")
+    await _emit_progress(task_id, "download_pages", 80, "LibGen: 搜索中...", "")
+    try:
+        import libgen_api_enhanced as lg
+        from libgen_api_enhanced import LibgenSearch
+        searcher = LibgenSearch()
+    except ImportError:
+        task_store.add_log(task_id, "LibGen: libgen-api-enhanced not installed")
+        return None
+
+    tmp_dir = report.get("tmp_dir", "")
+    if not tmp_dir:
+        return None
+
+    try:
+        filters = {}
+        search_term = ""
+        try:
+            if isbn:
+                search_term = isbn
+                filters["search_in"] = "identifier"
+            elif title:
+                search_term = title
+                if authors:
+                    search_term = f"{title} {authors[0]}"
+        except TypeError:
+            pass
+
+        if not search_term:
+            return None
+
+        results = searcher.search(search_term, search_type="title")
+        if not results or not isinstance(results, list):
+            task_store.add_log(task_id, "LibGen: no results found")
+            return None
+
+        task_store.add_log(task_id, f"LibGen: found {len(results)} results")
+        await _emit_progress(task_id, "download_pages", 85, f"LibGen: 找到 {len(results)} 个结果，下载中...", "")
+        for item in results[:5]:
+            try:
+                md5 = item.get("md5", item.get("Mirror_MD5", ""))
+                if md5:
+                    dl_urls = item.get("mirrors", item.get("Mirrors", []))
+                    if not dl_urls:
+                        dl_urls = [item.get("Mirror_1", ""), item.get("Mirror_2", "")]
+                    for dl_url in dl_urls:
+                        if not dl_url or not dl_url.startswith("http"):
+                            continue
+                        try:
+                            import requests as _req
+                            hdrs = {"User-Agent": "Mozilla/5.0"}
+                            kwargs = {"timeout": 60, "headers": hdrs, "verify": False}
+                            if proxy:
+                                kwargs["proxies"] = {"http": proxy, "https": proxy}
+                            resp = _req.get(dl_url, **kwargs)
+                            if resp.status_code == 200 and len(resp.content) > 1024:
+                                ext = item.get("extension", "pdf")
+                                filepath = os.path.join(tmp_dir, f"{md5}.{ext}")
+                                with open(filepath, "wb") as f:
+                                    f.write(resp.content)
+                                task_store.add_log(task_id, f"LibGen: downloaded {md5}.{ext} ({len(resp.content)/1024:.0f} KB)")
+                                return filepath
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+
+        task_store.add_log(task_id, "LibGen: all download attempts failed")
+    except Exception as e:
+        task_store.add_log(task_id, f"LibGen: error: {str(e)[:100]}")
+    return None
+
+
+async def _wait_for_user_confirmation(
+    task_id: str,
+    report: Dict[str, Any],
+    confirm_key: str = "zl_confirm",
+    timeout: int = 300,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """
+    Emit confirmation request to frontend and wait for user response.
+    Used for ZL download (consumes quota) and other destructive operations.
+    When candidates are provided, user can pick one from the list.
+    """
+    info = {
+        "type": "confirm_download",
+        "task_id": task_id,
+        "key": confirm_key,
+        "title": report.get("title", ""),
+        "isbn": report.get("isbn", ""),
+        "authors": report.get("authors", []),
+        "publisher": report.get("publisher", ""),
+        "download_source": report.get("download_source", ""),
+        "file_size": report.get("download_path", ""),
+    }
+    if candidates:
+        info["candidates"] = candidates
+
+    task_store.add_log(task_id, f"⏳ Waiting for user confirmation (key={confirm_key})...")
+    task_store.update(task_id, {f"_{confirm_key}": None, f"_{confirm_key}_selection": None, "waiting_confirmation": True})
+    await ws_manager.broadcast_all(info)
+
+    for _ in range(timeout):
+        await asyncio.sleep(1)
+        task = task_store.get(task_id)
+        if not task:
+            return False
+        decision = task.get(f"_{confirm_key}")
+        if decision is True:
+            task_store.update(task_id, {"waiting_confirmation": False})
+            return True  # selected book stored in _zl_confirm_selection
+        if decision is False:
+            task_store.update(task_id, {"waiting_confirmation": False})
+            task_store.add_log(task_id, f"⏭️ User declined {confirm_key}")
+            return False
+        if task.get("status") == "cancelled":
+            return False
+
+    task_store.add_log(task_id, f"⏰ Confirmation timeout ({timeout}s), skipping")
+    task_store.update(task_id, {"waiting_confirmation": False})
+    return False
+
+
+async def _wait_for_step_confirmation(
+    task_id: str,
+    step_name: str,
+    step_label: str,
+    config_info: Dict[str, Any],
+    timeout: int = 300,
+) -> bool:
+    """
+    Emit step confirmation request before optional steps (OCR, bookmark).
+    User can "execute" (return True), "skip" (return False), or timeout → skip.
+    """
+    task_store.add_log(task_id, f"⏳ [{step_label}] 等待确认... (超时 {timeout}s 后自动跳过)")
+    task_store.update(task_id, {
+        "waiting_step_confirm": True,
+        "_step_confirm": None,
+        "_step_confirm_step": step_name,
+    })
+    await ws_manager.broadcast_all({
+        "type": "confirm_step",
+        "task_id": task_id,
+        "step_name": step_name,
+        "step_label": step_label,
+        "config_info": config_info,
+    })
+
+    for _ in range(timeout):
+        await asyncio.sleep(1)
+        task = task_store.get(task_id)
+        if not task or task.get("status") == STATUS_CANCELLED:
+            task_store.update(task_id, {"waiting_step_confirm": False})
+            return False
+        decision = task.get("_step_confirm")
+        if decision is not None:
+            task_store.update(task_id, {
+                "waiting_step_confirm": False,
+                "_step_confirm": None,
+                "_step_confirm_step": None,
+            })
+            if decision is True:
+                task_store.add_log(task_id, f"✅ [{step_label}] 用户确认执行")
+            else:
+                task_store.add_log(task_id, f"⏭ [{step_label}] 用户跳过")
+            return decision
+
+    task_store.add_log(task_id, f"⏰ [{step_label}] 确认超时，跳过")
+    task_store.update(task_id, {
+        "waiting_step_confirm": False,
+        "_step_confirm": None,
+        "_step_confirm_step": None,
+    })
+    return False
+
+
+async def _step_download_pages(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Step 3/7: Download book PDF — 多级降级策略
+    本地检索 → Anna's Archive(stacks优先→直接兜底) → Z-Library(三层检索) → LibGen兜底
+    """
+    task_store.add_log(task_id, "Step 3/7: Downloading book PDF...")
+    await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 0})
+
+    # 准备临时目录
+    tmp_dir = config.get("tmp_dir", "")
+    if tmp_dir:
+        task_tmp = os.path.join(tmp_dir, task_id)
+        os.makedirs(task_tmp, exist_ok=True)
+        report["tmp_dir"] = task_tmp
+    else:
+        report["tmp_dir"] = os.path.join(os.path.dirname(__file__), "tmp", task_id)
+        os.makedirs(report["tmp_dir"], exist_ok=True)
+
+    ss_code = report.get("ss_code", "")
+    isbn = report.get("isbn", "")
+    proxy = config.get("http_proxy", "")
+    title = report.get("title", "")
+    authors = report.get("authors", [])
+    source = report.get("source", "")
+    downloaded = False
+    download_source = ""
+
+    # ── 本地检索：检查是否已存在 ──
+    finished_dir = config.get("finished_dir", "")
+    if finished_dir and title:
+        safe_title = title.replace("/", "_").replace("\\", "_")
+        for ext in (".pdf", ".epub", ".mobi"):
+            existing = os.path.join(finished_dir, f"{safe_title}{ext}")
+            if os.path.exists(existing) and os.path.getsize(existing) > 1024:
+                task_store.add_log(task_id, f"Book already downloaded: {os.path.basename(existing)}")
+                report["download_path"] = existing
+                report["download_source"] = "local_cache"
+                await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 100})
+                return report
+
+    # ── 确保 FlareSolverr 运行（供 AA 访问） ──
+    await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 5})
+    try:
+        from engine.flaresolverr import check_flaresolverr, start_flaresolverr, set_flare_port
+        set_flare_port(int(config.get("flaresolverr_port", 8191)))
+        if not await check_flaresolverr(config):
+            task_store.add_log(task_id, "Starting FlareSolverr for AA access...")
+            started, msg = await start_flaresolverr(config)
+            if started:
+                task_store.add_log(task_id, "FlareSolverr started")
+            else:
+                task_store.add_log(task_id, f"FlareSolverr: {msg}")
+                # 继续尝试（AA直接请求可能仍有效）
+    except ImportError:
+        task_store.add_log(task_id, "FlareSolverr module not available")
+    except Exception as e:
+        task_store.add_log(task_id, f"FlareSolverr check: {e}")
+
+    # ── 根据来源优先走对应的下载路径 ──
+    zl_first = (source == "zlibrary")
+    aa_only = (source == "annas_archive")
+    if zl_first:
+        zl_book_id = report.get("book_id", "")
+    else:
+        zl_book_id = ""
+
+    # ── 路径A/B自适应：根据来源决定降级策略 ──
+    #   ZL来源 → 仅ZL, AA来源 → 仅AA, 本地检索 → AA→ZL降级
+    if not zl_first:
+        # 默认：AA 优先
+        task_store.add_log(task_id, "=== Path A: Anna's Archive ===")
+        await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 10})
+
+        aa_result = await _download_via_aa_and_stacks(
+            task_id, config, report, ss_code, isbn, title, proxy,
+        )
+        if aa_result:
+            downloaded = True
+            download_source = "annas_archive"
+            report["download_path"] = aa_result
+
+    # ── 路径B（或ZL优先模式的路径1）：Z-Library ──
+    _task_chk = task_store.get(task_id)
+    if _task_chk and _task_chk.get("status") == STATUS_FAILED:
+        task_store.add_log(task_id, "任务已标记为失败，跳过后续下载尝试")
+        await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 100})
+        return report
+    if not downloaded and not aa_only:
+        task_store.add_log(task_id, "=== Path B: Z-Library ===")
+        await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 50})
+
+        zlib_email = config.get("zlib_email", "")
+        zlib_password = config.get("zlib_password", "")
+        if zlib_email and zlib_password:
+            try:
+                from engine.zlib_downloader import ZLibDownloader
+                dl = ZLibDownloader(config)
+
+                # 先登录获取配额信息
+                await _emit_progress(task_id, "download_pages", 55, "ZL 登录中...", "")
+                login_result = await dl.zlib_login()
+                if login_result.get("ok"):
+                    task_store.add_log(task_id, "ZL: logged in")
+                    balance = login_result.get("balance", "")
+                    if balance:
+                        task_store.add_log(task_id, f"ZL: {balance}")
+                        await _emit_progress(task_id, "download_pages", 60, f"ZL {balance}", "")
+
+                    _t = task_store.get(task_id)
+                    if _t and _t.get("status") == "cancelled":
+                        task_store.add_log(task_id, "ZL: download cancelled by user")
+                        return report
+
+                    # 搜索全部候选条目（不做标题过滤，返回所有结果让用户选）
+                    task_store.add_log(task_id, "ZL: searching by ISBN...")
+                    await _emit_progress(task_id, "download_pages", 65, "ZL ISBN 搜索中...", "")
+                    candidates = await dl.zlib_search_candidates(
+                        isbn=isbn, title=title, authors=authors,
+                    )
+                    await _emit_progress(task_id, "download_pages", 70, f"ZL 搜索到 {len(candidates)} 个候选，等待选择", "")
+                    if candidates:
+                        if zl_first:
+                            # 用户已从 Z-Lib 搜索结果中选择了此书，优先按 book_id 匹配
+                            task_store.add_log(task_id, f"ZL: {len(candidates)} candidates, matching selected book_id={zl_book_id}")
+                            selected_candidate = None
+                            if zl_book_id:
+                                for c in candidates:
+                                    if str(c.get("id")) == str(zl_book_id) or str(c.get("hash")) == str(zl_book_id):
+                                        selected_candidate = c
+                                        break
+                            if not selected_candidate:
+                                selected_candidate = candidates[0]
+                                task_store.add_log(task_id, f"ZL: book_id not matched, falling back to first candidate id={selected_candidate.get('id')}")
+                            sel_id = selected_candidate.get("id", "")
+                            sel_hash = selected_candidate.get("hash", "")
+                            if sel_id and sel_hash:
+                                _z = task_store.get(task_id)
+                                if _z and _z.get("status") == "cancelled":
+                                    task_store.add_log(task_id, "ZL: download cancelled by user")
+                                    return report
+
+                                sel_title = selected_candidate.get("title", title)
+                                zl_path = await dl.zlib_download_verified(
+                                    sel_id, sel_hash, report["tmp_dir"],
+                                    filename=sel_title,
+                                )
+                                if zl_path:
+                                    task_store.add_log(task_id, f"ZL: downloaded {os.path.basename(zl_path)}")
+                                    await _emit_progress(task_id, "download_pages", 90, "ZL 下载完成，验证中...", "")
+                                    downloaded = True
+                                    download_source = "zlibrary"
+                                    report["download_path"] = zl_path
+                                    await _emit_progress(task_id, "download_pages", 100, "ZL 下载完成", "")
+                                else:
+                                    task_store.add_log(task_id, "ZL: auto-download verification failed, trying next candidate")
+                                    for c in candidates[1:3]:
+                                        _z2 = task_store.get(task_id)
+                                        if _z2 and _z2.get("status") == "cancelled":
+                                            task_store.add_log(task_id, "ZL: download cancelled by user")
+                                            break
+
+                                        sid, shash = c.get("id", ""), c.get("hash", "")
+                                        if sid and shash:
+                                            zl_path2 = await dl.zlib_download_verified(sid, shash, report["tmp_dir"], filename=c.get("title", title))
+                                            if zl_path2:
+                                                task_store.add_log(task_id, f"ZL: downloaded candidate {sid}")
+                                                downloaded = True
+                                                download_source = "zlibrary"
+                                                report["download_path"] = zl_path2
+                                                break
+                            else:
+                                task_store.add_log(task_id, "ZL: auto-select failed (missing id/hash in candidate)")
+                        else:
+                            task_store.add_log(task_id, f"ZL: found {len(candidates)} candidates, requesting user selection...")
+                            confirmed = await _wait_for_user_confirmation(
+                                task_id, report, "zl_confirm", 300, candidates,
+                            )
+                            if confirmed:
+                                # 读取用户选择的书籍
+                                task = task_store.get(task_id)
+                                selection = task.get("_zl_confirm_selection", {})
+                                sel_id = selection.get("id", "")
+                                sel_hash = selection.get("hash", "")
+                                if sel_id and sel_hash:
+                                    _z3 = task_store.get(task_id)
+                                    if _z3 and _z3.get("status") == "cancelled":
+                                        task_store.add_log(task_id, "ZL: download cancelled by user")
+                                        return report
+
+                                    task_store.add_log(task_id, f"ZL: user selected book {sel_id}")
+                                    sel_title = selection.get("title", "")
+                                    if not sel_title:
+                                        sel_title = report.get("title", "")
+                                    zl_path = await dl.zlib_download_verified(
+                                        sel_id, sel_hash, report["tmp_dir"],
+                                        filename=sel_title,
+                                    )
+                                    if zl_path:
+                                        task_store.add_log(task_id, f"ZL: downloaded {os.path.basename(zl_path)}")
+                                        await _emit_progress(task_id, "download_pages", 90, "ZL 下载完成，验证中...", "")
+                                        downloaded = True
+                                        download_source = "zlibrary"
+                                        report["download_path"] = zl_path
+                                        await _emit_progress(task_id, "download_pages", 100, "ZL 下载完成", "")
+                                    else:
+                                        task_store.add_log(task_id, "ZL: download verification failed")
+                                else:
+                                    task_store.add_log(task_id, "ZL: no book selected by user")
+                            else:
+                                task_store.add_log(task_id, "ZL: user declined, skipping")
+                    else:
+                        task_store.add_log(task_id, "ZL: no candidates found on Z-Library")
+                else:
+                    task_store.add_log(task_id, f"ZL: login failed — {login_result.get('message', 'unknown')}")
+            except ImportError:
+                task_store.add_log(task_id, "ZL: module not available")
+            except Exception as e:
+                task_store.add_log(task_id, f"ZL: error: {str(e)[:150]}")
+        else:
+            if zl_first:
+                task_store.add_log(task_id, "ZL: no credentials configured, falling back to AA")
+            else:
+                task_store.add_log(task_id, "ZL: no credentials configured, skipping")
+
+    # ── 路径C：LibGen 兜底（仅本地检索时允许降级）──
+    if not downloaded and source not in ("zlibrary", "annas_archive") and config.get("libgen_enabled", True):
+        task_store.add_log(task_id, "=== Path C: LibGen (last resort) ===")
+        await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 80})
+
+        libgen_path = await _download_via_libgen(
+            task_id, report, config, title, isbn, authors, proxy,
+        )
+        if libgen_path:
+            downloaded = True
+            download_source = "libgen"
+            report["download_path"] = libgen_path
+
+    # ── 结果 ──
+    if downloaded:
+        report["download_source"] = download_source
+        task_store.add_log(task_id, f"Download complete via {download_source}: {os.path.basename(report['download_path'])}")
+    else:
+        task_store.add_log(task_id, "All download paths (AA/stacks → ZL → LibGen) exhausted — download failed")
+        report["download_note"] = "download failed"
+
+    await _emit(task_id, "step_progress", {"step": "download_pages", "progress": 100})
+    return report
+
+
+async def _step_convert_pdf(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    task_store.add_log(task_id, "Step 4/7: Converting pages to PDF...")
+    await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 0})
+
+    tmp_dir = report.get("tmp_dir", "")
+    output_dir = config.get("download_dir", "")
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    title = report.get("title", "book").replace("/", "_").replace("\\", "_")
+    pdf_name = f"{title}.pdf"
+    pdf_path = os.path.join(output_dir, pdf_name) if output_dir else os.path.join(tmp_dir, pdf_name)
+
+    await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 30})
+
+    try:
+        image_files = []
+        if tmp_dir and os.path.exists(tmp_dir):
+            for ext in (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"):
+                image_files.extend(sorted(Path(tmp_dir).glob(f"*{ext}")))
+                image_files.extend(sorted(Path(tmp_dir).glob(f"*{ext.upper()}")))
+
+        if image_files:
+            task_store.add_log(task_id, f"Found {len(image_files)} images, converting to PDF...")
+            await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 50})
+
+            try:
+                import fitz
+                doc = fitz.open()
+                for img_file in image_files:
+                    try:
+                        img = fitz.open(str(img_file))
+                        rect = img[0].rect
+                        page = doc.new_page(width=rect.width, height=rect.height)
+                        page.insert_image(rect, filename=str(img_file))
+                        img.close()
+                    except Exception:
+                        page = doc.new_page()
+                        page.insert_image(page.rect, filename=str(img_file))
+                doc.save(pdf_path)
+                doc.close()
+                task_store.add_log(task_id, f"PDF created: {pdf_path}")
+            except ImportError:
+                task_store.add_log(task_id, "PyMuPDF not available, trying img2pdf...")
+                import img2pdf
+                with open(pdf_path, "wb") as f:
+                    data = img2pdf.convert([str(p) for p in image_files])
+                    if data:
+                        f.write(data)
+                task_store.add_log(task_id, f"PDF created via img2pdf: {pdf_path}")
+
+            report["pdf_path"] = pdf_path
+            report["page_count"] = len(image_files)
+        else:
+            # 优先使用 download_path（下载步骤已保存的路径）
+            dl_path = report.get("download_path", "")
+            if dl_path and os.path.exists(dl_path) and os.path.getsize(dl_path) > 1024:
+                # 验证文件是否为有效 PDF
+                is_pdf = False
+                try:
+                    with open(dl_path, "rb") as _fh:
+                        if _fh.read(4) == b"%PDF":
+                            is_pdf = True
+                except Exception:
+                    pass
+                if is_pdf:
+                    task_store.add_log(task_id, f"Using downloaded file as PDF: {dl_path}")
+                    out_dir = config.get("download_dir", "")
+                    if out_dir and os.path.abspath(dl_path).startswith(os.path.abspath(out_dir)):
+                        # 文件已在 download_dir 中
+                        report["pdf_path"] = dl_path
+                    else:
+                        # 复制到 download_dir
+                        ss_code = report.get("ss_code", "")
+                        safe_title = re.sub(r'[<>:"/\\|?*]', '_', report.get("title", "book")).strip()[:80]
+                        fname = os.path.basename(dl_path)
+                        ext = os.path.splitext(fname)[1] or ".pdf"
+                        new_name = f"{ss_code}_{safe_title}{ext}" if ss_code else f"{safe_title}{ext}"
+                        dest_path = os.path.join(out_dir, new_name)
+                        shutil.copy2(dl_path, dest_path)
+                        report["pdf_path"] = dest_path
+                        task_store.add_log(task_id, f"PDF copied to download dir: {dest_path}")
+                    await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 100})
+                    return report
+
+            task_store.add_log(task_id, "No image files found in tmp dir, checking for existing PDF...")
+            pdf_files = list(Path(tmp_dir).glob("*.pdf")) if tmp_dir else []
+            if pdf_files:
+                from_path = str(pdf_files[0])
+                task_store.add_log(task_id, f"Found PDF: {from_path}")
+                # 复制到 download_dir（设置中的下载目录）
+                out_dir = config.get("download_dir", "")
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                    ss_code = report.get("ss_code", "")
+                    safe_title = re.sub(r'[<>:"/\\|?*]', '_', report.get("title", "book")).strip()[:80]
+                    ext = os.path.splitext(from_path)[1] or ".pdf"
+                    new_name = f"{ss_code}_{safe_title}{ext}" if ss_code else f"{safe_title}{ext}"
+                    dest_path = os.path.join(out_dir, new_name)
+                    shutil.copy2(from_path, dest_path)
+                    report["pdf_path"] = dest_path
+                    task_store.add_log(task_id, f"PDF copied to download dir: {dest_path}")
+                else:
+                    report["pdf_path"] = from_path
+            else:
+                task_store.add_log(task_id, "No images or PDF found to convert")
+                await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 100})
+                return report
+    except Exception as e:
+        task_store.add_log(task_id, f"PDF conversion error: {e}")
+
+    await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 100})
+    return report
+
+
+def _is_scanned(pdf_path: str, sample_pages: int = 5, python_cmd: str = "") -> bool:
+    """判断PDF是否为扫描件（文字占比低），返回True=需要OCR"""
+    # Try direct import first (works in dev/venv)
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        blank = 0
+        for i in range(min(sample_pages, len(doc))):
+            text = doc[i].get_text()
+            non_ws = sum(1 for c in text if c.strip())
+            if len(text) == 0 or non_ws < len(text) * 0.6:
+                blank += 1
+        doc.close()
+        return blank >= sample_pages * 0.6
+    except ImportError:
+        pass  # fitz not available, try fallback below
+    except Exception:
+        pass  # fitz error, try fallback below
+
+    # Fallback: use system Python subprocess (works in frozen exe)
+    if python_cmd:
+        try:
+            import subprocess as _sp
+            import shlex as _sh
+            code = (
+                "import fitz;"
+                f"d=fitz.open(r{repr(str(pdf_path))});"
+                f"blank=0;n=min({sample_pages},len(d));"
+                "for i in range(n):"
+                " t=d[i].get_text();"
+                " nws=sum(1 for c in t if c.strip());"
+                " blank+=1 if len(t)==0 or nws<len(t)*0.6 else 0;"
+                "d.close();"
+                f"print('1' if blank>=n*0.6 else '0')"
+            )
+            r = _sp.run([python_cmd, "-c", code], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+            if r.returncode == 0 and r.stdout.strip() in ("0", "1"):
+                return r.stdout.strip() == "1"
+        except Exception:
+            pass
+
+    # Ultimate fallback: assume scanned (needs OCR)
+    return True
+
+
+def _is_ocr_readable(pdf_path: str, sample_pages: int = 5, min_cjk_ratio: float = 0.15, python_cmd: str = "") -> bool:
+    """检测OCR后的PDF文字层是否为可读中文（非乱码），CJK比率>=15%"""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        total = doc.page_count
+        indices = [int(total * i / (sample_pages + 1)) for i in range(1, sample_pages + 1)]
+        readable = 0
+        for idx in indices:
+            text = doc[idx].get_text()
+            if not text.strip():
+                continue
+            total_chars = sum(1 for c in text if not c.isspace())
+            cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' or '\uf900' <= c <= '\ufaff')
+            ratio = cjk / total_chars if total_chars > 0 else 0
+            if ratio >= min_cjk_ratio:
+                readable += 1
+        doc.close()
+        return readable >= sample_pages * 0.6
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback: use system Python subprocess
+    if python_cmd:
+        try:
+            import subprocess as _sp
+            import shlex as _sh
+            code = (
+                "import fitz;"
+                f"d=fitz.open(r{repr(str(pdf_path))});"
+                f"total=d.page_count;n=min({sample_pages},total);"
+                f"indices=[int(total*i/(n+1)) for i in range(1,n+1)];"
+                "readable=0;"
+                "for idx in indices:"
+                " t=d[idx].get_text();"
+                " if not t.strip(): continue;"
+                " tc=sum(1 for c in t if not c.isspace());"
+                " cjk=sum(1 for c in t if '\u4e00'<=c<='\u9fff' or '\u3400'<=c<='\u4dbf' or '\uf900'<=c<='\ufaff');"
+                " r=cjk/tc if tc>0 else 0;"
+                " readable+=1 if r>=0.15 else 0;"
+                "d.close();"
+                "print('1' if readable>=n*0.6 else '0')"
+            )
+            r = _sp.run([python_cmd, "-c", code], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+            if r.returncode == 0 and r.stdout.strip() in ("0", "1"):
+                return r.stdout.strip() == "1"
+        except Exception:
+            pass
+
+    return True  # 无法验证时假设通过
+
+
+async def _step_ocr(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    task_store.add_log(task_id, "Step 5/7: Running OCR...")
+    await _emit(task_id, "step_progress", {"step": "ocr", "progress": 0})
+
+    pdf_path = report.get("pdf_path", "")
+    if not pdf_path or not os.path.exists(pdf_path):
+        task_store.add_log(task_id, "No PDF to OCR")
+        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+        return report
+
+    # Close any cached fitz handle so OCR can overwrite the file
+    try:
+        from api.toc import close_cached_doc
+        close_cached_doc(pdf_path)
+    except Exception:
+        pass
+
+    ocr_engine = config.get("ocr_engine", "tesseract")
+    ocr_lang = config.get("ocr_languages", "chi_sim+eng")
+    ocr_jobs = config.get("ocr_jobs", 1)
+    ocr_timeout = config.get("ocr_timeout", 3600)
+    ocr_enabled = config.get("ocr_jobs", 0) > 0
+
+    # Build config summary for the confirmation dialog
+    if ocr_engine == "llm_ocr":
+        config_info = {
+            "引擎": "LLM OCR (视觉大模型)",
+            "模型": config.get("llm_ocr_model", ""),
+            "端点": config.get("llm_ocr_endpoint", ""),
+            "并发数": str(config.get("llm_ocr_concurrency", 1)),
+        }
+    elif ocr_engine == "mineru":
+        config_info = {
+            "引擎": "MinerU 线上 API",
+            "模型": config.get("mineru_model", "vlm"),
+        }
+    elif ocr_engine == "paddleocr_online":
+        config_info = {
+            "引擎": "PaddleOCR-VL-1.5 线上 API",
+        }
+    else:
+        engine_labels = {
+            "tesseract": "Tesseract OCR",
+            "paddleocr": "PaddleOCR",
+            "mineru": "MinerU 线上 API",
+            "paddleocr_online": "PaddleOCR-VL-1.5 线上 API",
+        }
+        config_info = {
+            "引擎": engine_labels.get(ocr_engine, ocr_engine),
+            "语言": ocr_lang,
+            "线程数": str(ocr_jobs),
+            "超时": f"{ocr_timeout}s",
+            "配置已启用": "是" if ocr_enabled else "否（ocr_jobs=0）",
+        }
+
+    confirmed = True  # default skip, controlled by ocr_confirm_enabled
+    if config.get("ocr_confirm_enabled", False):
+        confirmed = await _wait_for_step_confirmation(
+        task_id=task_id,
+        step_name="ocr",
+        step_label="OCR识别",
+        config_info=config_info,
+    )
+    if not confirmed:
+        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+        return report
+
+    if not ocr_enabled:
+        task_store.add_log(task_id, "OCR disabled in config, skipping")
+        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+        return report
+    ocr_oversample = str(config.get("ocr_oversample", 200))
+    _opt_level = "0"
+    if config.get("pdf_compress", False):
+        import shutil as _opt_sh
+        if _opt_sh.which("gswin64c") or _opt_sh.which("gs"):
+            _opt_level = "1"
+            task_store.add_log(task_id, "PDF optimization enabled (GhostScript found for ocrmypdf --optimize)")
+        else:
+            task_store.add_log(task_id, "PDF optimization requested but GhostScript not found; ocrmypdf will skip --optimize")
+    else:
+        task_store.add_log(task_id, "PDF optimization disabled")
+
+    if ocr_engine == "llm_ocr":
+        task_store.add_log(task_id, f"OCR engine: llm_ocr (model: {config.get('llm_ocr_model', '')}, concurrency: {config.get('llm_ocr_concurrency', 1)})")
+        task_store.add_log(task_id, "LLM OCR uses dense-mode visual recognition; ocrmypdf settings above are ignored")
+    else:
+        task_store.add_log(task_id, f"OCR engine: {ocr_engine}, languages: {ocr_lang}, jobs: {ocr_jobs}")
+
+    # ── In frozen/PyInstaller exe, find system Python for ocrmypdf ──
+    _py_for_ocr = sys.executable
+    if getattr(sys, 'frozen', False):
+        import shutil as _shutil
+        _found_py = None
+        for _candidate in ["python", "python3", "py"]:
+            _f = _shutil.which(_candidate)
+            if _f:
+                _found_py = _f
+                break
+        if not _found_py:
+            for _candidate in [
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python314", "python.exe"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Python", "Python313", "python.exe"),
+                r"C:\Python314\python.exe",
+                r"C:\Python313\python.exe",
+            ]:
+                if os.path.exists(_candidate):
+                    _found_py = _candidate
+                    break
+        if _found_py and _found_py != sys.executable:
+            _py_for_ocr = _found_py
+            if ocr_engine != "llm_ocr":
+                task_store.add_log(task_id, f"OCR: using system Python at {_py_for_ocr}")
+        elif ocr_engine != "llm_ocr":
+            task_store.add_log(task_id, "OCR: no system Python found for ocrmypdf — please install: python -m pip install ocrmypdf")
+
+    # ── Ensure the right OCR plugin is (un)installed ──
+    try:
+        import subprocess as _sp
+
+        # ── Detect PaddleOCR Python 3.11 venv ──
+        _paddle_venv_py = ""
+        if ocr_engine == "paddleocr":
+            _base_dir = os.path.dirname(os.path.dirname(__file__))
+            for _cand in [
+                r"D:\opencode\book-downloader\venv-paddle311\Scripts\python.exe",
+                os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
+            ]:
+                if os.path.exists(_cand):
+                    # Verify the venv has all needed packages
+                    _vr = _sp.run([_cand, "-c", "import ocrmypdf_paddleocr"],
+                                  capture_output=True, timeout=15)
+                    if _vr.returncode == 0:
+                        _paddle_venv_py = _cand
+                        task_store.add_log(task_id, f"PaddleOCR: using venv at {_paddle_venv_py}")
+                        break
+            if not _paddle_venv_py:
+                task_store.add_log(task_id,
+                    "PaddleOCR: Python 3.11 venv not found — 点击设置页 OCR → PaddleOCR → 安装 自动搭建")
+    except Exception as _e:
+        task_store.add_log(task_id, f"OCR: plugin management warning: {_e}")
+
+    try:
+        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 10})
+
+        # Count PDF pages for progress tracking
+        _total_pages = 0
+        try:
+            import fitz as _fitz
+            _doc = _fitz.open(pdf_path)
+            _total_pages = len(_doc)
+            _doc.close()
+        except Exception:
+            pass
+
+        if ocr_engine == "tesseract":
+            task_store.add_log(task_id, "Running OCRmyPDF with Tesseract...")
+
+            # Check if PDF already has text layer (skip if born-digital)
+            if not _is_scanned(pdf_path, python_cmd=_py_for_ocr):
+                task_store.add_log(task_id, "PDF already has text layer, skipping OCR")
+                report["ocr_done"] = True
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                return report
+
+            output_pdf = pdf_path.replace(".pdf", "_ocr.pdf")
+            cmd = [
+                _py_for_ocr, "-m", "ocrmypdf",
+                "--ocr-engine", "tesseract",
+                "--force-ocr",
+                "--optimize", _opt_level,
+                "--force-ocr",
+                "--oversample", ocr_oversample,
+                "-l", ocr_lang,
+                "-j", str(ocr_jobs),
+                "--output-type", "pdf",
+                pdf_path,
+                output_pdf,
+            ]
+            await _emit(task_id, "step_progress", {"step": "ocr", "progress": 30})
+
+            try:
+                _exit = await _run_ocrmypdf_with_progress(task_id, cmd, timeout=ocr_timeout, total_pages=_total_pages, output_pdf=output_pdf)
+                if _exit == 0:
+                    task_store.add_log(task_id, "OCR completed, validating quality...")
+                    if _is_ocr_readable(output_pdf, python_cmd=_py_for_ocr):
+                        os.replace(output_pdf, pdf_path)
+                        task_store.add_log(task_id, "OCR quality check passed")
+                        report["ocr_done"] = True
+                    else:
+                        task_store.add_log(task_id, "OCR quality check failed (possible garbled text), keeping original PDF")
+                        try:
+                            os.remove(output_pdf)
+                        except Exception:
+                            pass
+                else:
+                    task_store.add_log(task_id, f"Tesseract failed with exit code {_exit}")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100, "detail": "完成"})
+            except asyncio.TimeoutError:
+                task_store.add_log(task_id, f"OCR timed out after {ocr_timeout}s")
+        elif ocr_engine == "paddleocr":
+            task_store.add_log(task_id, "Running OCRmyPDF with PaddleOCR...")
+            
+            # 1. Check if PDF already has text layer
+            if not _is_scanned(pdf_path, python_cmd=_py_for_ocr):
+                task_store.add_log(task_id, "PDF already has text layer, skipping OCR")
+                report["ocr_done"] = True
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                return report
+
+            output_pdf = pdf_path.replace(".pdf", "_ocr.pdf")
+            if not _paddle_venv_py:
+                task_store.add_log(task_id, "PaddleOCR: Python 3.11 venv not available, skipping OCR")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                return report
+
+            await _emit(task_id, "step_progress", {"step": "ocr", "progress": 0})
+
+            # PaddleOCR always uses single process (PaddlePaddle uses all CPU cores internally)
+            from platform_utils import configure_tesseract_env
+            configure_tesseract_env()
+            _ocr_env = {**os.environ}
+            cmd = [
+                _paddle_venv_py, "-m", "ocrmypdf",
+                "--plugin", "ocrmypdf_paddleocr",
+                "--optimize", _opt_level,
+                "--oversample", ocr_oversample,
+                "-l", ocr_lang or "chi_sim+eng",
+                "-j", "1",
+                "--output-type", "pdf",
+                "--max-image-mpixels", "0",
+                "--mode", "force",
+                pdf_path,
+                output_pdf,
+            ]
+            exit_code = await _run_ocrmypdf_with_progress(
+                task_id, cmd, env=_ocr_env,
+                timeout=ocr_timeout, total_pages=_total_pages,
+                output_pdf=output_pdf,
+            )
+
+            if exit_code == 0:
+                task_store.add_log(task_id, "OCR completed, validating quality...")
+                if _is_ocr_readable(output_pdf, python_cmd=_py_for_ocr):
+                    os.replace(output_pdf, pdf_path)
+                    task_store.add_log(task_id, "OCR quality check passed")
+                    report["ocr_done"] = True
+                else:
+                    task_store.add_log(task_id, "OCR quality check failed (possible garbled text), keeping original PDF")
+                    try:
+                        os.remove(output_pdf)
+                    except Exception:
+                        pass
+            else:
+                # Exit code != 0, but output PDF may still be valid (e.g. process killed after finishing)
+                if os.path.exists(output_pdf) and os.path.getsize(output_pdf) > 1024:
+                    task_store.add_log(task_id, f"PaddleOCR exited with code {exit_code} but output exists, validating...")
+                    if _is_ocr_readable(output_pdf, python_cmd=_py_for_ocr):
+                        os.replace(output_pdf, pdf_path)
+                        task_store.add_log(task_id, "OCR output salvaged despite non-zero exit code")
+                        report["ocr_done"] = True
+                    else:
+                        task_store.add_log(task_id, f"PaddleOCR output invalid, code {exit_code}")
+                        try:
+                            os.remove(output_pdf)
+                        except Exception:
+                            pass
+                else:
+                    task_store.add_log(task_id, f"PaddleOCR failed with exit code {exit_code}")
+
+        elif ocr_engine == "llm_ocr":
+            output_pdf_tmp = pdf_path + ".llmocr.pdf"
+            ocr_endpoint = config.get("llm_ocr_endpoint", "http://127.0.0.1:1234/v1").rstrip("/")
+            # Auto-append /v1 for lmstudio-style endpoints (user may type just host:port)
+            if not ocr_endpoint.endswith("/v1"):
+                ocr_endpoint += "/v1"
+            ocr_model = config.get("llm_ocr_model", "qwen3-vl-4b-instruct")
+            ocr_concurrency = str(config.get("llm_ocr_concurrency", 1))
+            task_store.add_log(task_id, f"LLM OCR: {ocr_model} @ {ocr_endpoint}, concurrency={ocr_concurrency}")
+            await _emit(task_id, "step_progress", {"step": "ocr", "progress": 10})
+
+            local_ocr_bin = "local-llm-pdf-ocr"
+
+            # Resolve the local-llm-pdf-ocr tool via uv (it lives in its own venv
+            # with resolved dependencies including surya/torch).
+            import shutil as _shutil2
+            uv_bin = _shutil2.which("uv") or _shutil2.which("uv.exe")
+            if not uv_bin:
+                uv_candidate = os.path.expanduser(r"~\.local\bin\uv.exe")
+                uv_bin = uv_candidate if os.path.exists(uv_candidate) else None
+            # Resolve project root: dev mode goes up from backend/engine/pipeline.py,
+            # frozen mode uses the directory containing the exe
+            if getattr(sys, 'frozen', False):
+                _llm_ocr_base = Path(sys.executable).resolve().parent  # exe directory
+                llm_ocr_project = str(_llm_ocr_base / "local-llm-pdf-ocr")
+            else:
+                _llm_ocr_base = Path(__file__).resolve().parent.parent  # backend/
+                llm_ocr_project = str(_llm_ocr_base.parent / "local-llm-pdf-ocr")
+            cmd = [local_ocr_bin, pdf_path, output_pdf_tmp,
+                   "--api-base", ocr_endpoint, "--model", ocr_model,
+                   "--dense-mode", "always", "--concurrency", ocr_concurrency]
+
+            ocr_detect_batch = str(config.get("llm_ocr_detect_batch", 20))
+
+            if uv_bin and os.path.isdir(llm_ocr_project):
+                cmd = [uv_bin, "run",
+                       "local-llm-pdf-ocr", pdf_path, output_pdf_tmp,
+                       "--api-base", ocr_endpoint, "--model", ocr_model,
+                       "--dense-mode", "always", "--concurrency", ocr_concurrency,
+                       "--detect-batch-size", ocr_detect_batch,
+                       "--no-verify-model"]
+                _ocr_cwd = llm_ocr_project
+                task_store.add_log(task_id, f"LLM OCR: running via uv from {llm_ocr_project}")
+            else:
+                cmd = [local_ocr_bin, pdf_path, output_pdf_tmp,
+                       "--api-base", ocr_endpoint, "--model", ocr_model,
+                       "--dense-mode", "always", "--concurrency", ocr_concurrency,
+                       "--detect-batch-size", ocr_detect_batch,
+                       "--no-verify-model"]
+                _ocr_cwd = None
+
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=_ocr_cwd,
+                )
+                task_store.add_log(task_id, f"LLM OCR: streaming output from {os.path.basename(cmd[0])}...")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 10,
+                                 "stage": "convert", "stage_progress": 0,
+                                 "stage_total": 4, "message": "转换 PDF 页面..."})
+
+                stdout_bytes = bytearray()
+                stderr_bytes = bytearray()
+
+                _stage_names = {"convert": "PDF 光栅化", "detect": "版面检测", "ocr": "LLM 逐框 OCR", "refine": "补漏重识别", "embed": "嵌入文字层"}
+                _stage_order = {"convert": 0, "detect": 1, "ocr": 2, "refine": 3, "embed": 4}
+                _total_stages = 5
+
+                # Stage-specific prefix mapping (lowercase) for progress line detection
+                _stage_prefixes = {
+                    "convert": ("converting", "converted "),
+                    "detect": ("detecting layout", "layout detection complete"),
+                    "ocr": ("ocr (", "grounded ocr ("),
+                    "refine": ("refining boxes",),
+                    "embed": ("done", "writing output"),
+                }
+
+                async def _read_stream(stream, buf):
+                    while True:
+                        line = await stream.readline()
+                        if not line:
+                            break
+                        buf.extend(line)
+                        text = line.decode(errors='replace').strip()
+                        if not text:
+                            continue
+                        text_lower = text.lstrip().lower()
+                        parsed = False
+                        # Match stage by prefixes
+                        for key, label in _stage_names.items():
+                            prefixes = _stage_prefixes.get(key, ())
+                            for prefix in prefixes:
+                                if text_lower.startswith(prefix):
+                                    # Try to extract percentage
+                                    import re as _re
+                                    pct_match = _re.search(r'(\d+)%', text)
+                                    if pct_match:
+                                        pct = int(pct_match.group(1))
+                                        stage_idx = _stage_order.get(key, 0)
+                                        overall = 10 + int((stage_idx + pct / 100.0) / _total_stages * 80)
+                                        _detail = f"{label}: {pct}%"
+                                        # Try to extract (current/total) page numbers
+                                        _pg_match = _re.search(r'\((\d+)/(\d+)\)', text)
+                                        _emit_data = {
+                                            "step": "ocr", "progress": overall,
+                                            "stage": key, "stage_progress": pct,
+                                            "stage_total": _total_stages,
+                                            "detail": _detail,
+                                        }
+                                        if _pg_match:
+                                            _emit_data["current_page"] = int(_pg_match.group(1))
+                                            _emit_data["total_pages"] = int(_pg_match.group(2))
+                                            _detail += f" ({_pg_match.group(1)}/{_pg_match.group(2)} 页)"
+                                        await _emit(task_id, "step_progress", _emit_data)
+                                        task_store.add_log(task_id, f"[OCR] {_detail}")
+                                        parsed = True
+                                    elif any(w in text_lower for w in ("complete", "done", "detection complete", "converted")):
+                                        stage_idx = _stage_order.get(key, 0)
+                                        pct = 100
+                                        overall = 10 + int((stage_idx + 1) / _total_stages * 80)
+                                        _detail = f"{label}: 完成"
+                                        await _emit(task_id, "step_progress", {
+                                            "step": "ocr", "progress": overall,
+                                            "stage": key, "stage_progress": pct,
+                                            "stage_total": _total_stages,
+                                            "detail": _detail,
+                                        })
+                                        task_store.add_log(task_id, f"[OCR] {_detail}")
+                                        parsed = True
+                                    break
+                            if parsed:
+                                break
+                        if not parsed:
+                            # Log non-progress lines (errors, summaries)
+                            task_store.add_log(task_id, f"  {text[:200]}")
+
+                stdout_task = asyncio.create_task(_read_stream(proc.stdout, stdout_bytes))
+                stderr_task = asyncio.create_task(_read_stream(proc.stderr, stderr_bytes))
+
+                # ── Poll subprocess, checking pause/cancel every 2s ──
+                ocr_timeout = int(config.get("ocr_timeout", 7200))
+                _started_at = time.time()
+                _ocr_done = False
+                while not _ocr_done:
+                    done, pending = await asyncio.wait(
+                        [stdout_task, stderr_task, asyncio.ensure_future(proc.wait())],
+                        timeout=2.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    # Check if subprocess finished
+                    if proc.returncode is not None:
+                        _ocr_done = True
+                        # Drain remaining stream data
+                        try:
+                            await asyncio.wait_for(stdout_task, timeout=5.0)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            stdout_task.cancel()
+                        try:
+                            await asyncio.wait_for(stderr_task, timeout=5.0)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            stderr_task.cancel()
+                        break
+                    # Check timeout
+                    if time.time() - _started_at > ocr_timeout:
+                        task_store.add_log(task_id, "LLM OCR timed out")
+                        _kill_proc_tree(proc.pid)
+                        stdout_task.cancel()
+                        stderr_task.cancel()
+                        break
+                    # Check pause/cancel
+                    _t = task_store.get(task_id)
+                    if not _t:
+                        _kill_proc_tree(proc.pid)
+                        stdout_task.cancel()
+                        stderr_task.cancel()
+                        break
+                    if _t.get("status") == STATUS_CANCELLED:
+                        task_store.add_log(task_id, "LLM OCR cancelled")
+                        _kill_proc_tree(proc.pid)
+                        stdout_task.cancel()
+                        stderr_task.cancel()
+                        return report
+                    if _t.get("status") == STATUS_PAUSED:
+                        task_store.add_log(task_id, "⏸ OCR 已暂停。注意：恢复后将重新开始整个 OCR（已处理进度丢失）。")
+                        await _emit(task_id, "step_progress", {
+                            "step": "ocr", "progress": 10,
+                            "detail": "OCR 已暂停，恢复后重新开始",
+                        })
+                        _kill_proc_tree(proc.pid)
+                        stdout_task.cancel()
+                        stderr_task.cancel()
+                        # Block until resumed or cancelled
+                        _cancelled = await _check_paused(task_id)
+                        if _cancelled:
+                            task_store.add_log(task_id, "Task cancelled during OCR pause")
+                            return report
+                        # ── Resume: restart OCR from scratch ──
+                        task_store.add_log(task_id, "↩ 恢复任务，重新开始 OCR（已处理进度丢失）...")
+                        await _emit(task_id, "step_progress", {
+                            "step": "ocr", "progress": 10,
+                            "detail": "重新开始 OCR...",
+                        })
+                        # Clean up partial output
+                        try:
+                            os.remove(output_pdf_tmp)
+                        except Exception:
+                            pass
+                        # Re-spawn subprocess
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=_ocr_cwd,
+                        )
+                        stdout_bytes = bytearray()
+                        stderr_bytes = bytearray()
+                        stdout_task = asyncio.create_task(_read_stream(proc.stdout, stdout_bytes))
+                        stderr_task = asyncio.create_task(_read_stream(proc.stderr, stderr_bytes))
+                        _started_at = time.time()
+                        continue
+
+                stdout = bytes(stdout_bytes)
+                stderr = bytes(stderr_bytes)
+
+                if proc.returncode == 0 and os.path.exists(output_pdf_tmp) and os.path.getsize(output_pdf_tmp) > 1024:
+                    os.replace(output_pdf_tmp, pdf_path)
+                    report["ocr_done"] = True
+                    task_store.add_log(task_id, "LLM OCR completed successfully")
+                else:
+                    stdout_str = stdout.decode()[:300] if stdout else ""
+                    err_msg = (stderr.decode()[:300] if stderr else stdout_str or "unknown")
+                    task_store.add_log(task_id, f"LLM OCR failed (code {proc.returncode}): {err_msg}")
+            except FileNotFoundError:
+                task_store.add_log(task_id, 
+                    "local-llm-pdf-ocr not found. "
+                    "安装方法: git clone https://github.com/Callioper/local-llm-pdf-ocr.git "
+                    + llm_ocr_project + " && cd " + llm_ocr_project + " && uv sync"
+                )
+            except asyncio.TimeoutError:
+                task_store.add_log(task_id, "LLM OCR timed out")
+            except Exception as e:
+                task_store.add_log(task_id, f"LLM OCR error: {str(e)[:200]}")
+
+        elif ocr_engine == "mineru":
+            mineru_token = config.get("mineru_token", "")
+            if not mineru_token:
+                task_store.add_log(task_id, "MinerU: no token configured, skipping")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                return report
+
+            mineru_model = config.get("mineru_model", "vlm")
+            task_store.add_log(task_id, f"MinerU OCR (hybrid): Surya detection + MinerU API spatial (model={mineru_model})")
+            await _emit(task_id, "step_progress", {"step": "ocr", "progress": 5, "detail": "Running Surya detection..."})
+
+            try:
+                from backend.engine.surya_detect import run_surya_detect, SuryaDetectError
+                from backend.engine.mineru_client import MinerUClient, MinerUTimeoutError, parse_layout_from_zip
+                from backend.engine.pdf_api_embed import allocate_text_to_surya_boxes, embed_with_surya_boxes
+
+                # Step 1: Surya line detection
+                try:
+                    surya_boxes = await run_surya_detect(pdf_path, dpi=200)
+                except SuryaDetectError as e:
+                    task_store.add_log(task_id, f"MinerU: Surya detection failed — {e}. Falling back to block-level layout.")
+                    from backend.engine.pdf_api_embed import embed_api_text_layer
+                    client = MinerUClient(token=mineru_token)
+                    try:
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        zip_bytes = await client.process_pdf(
+                            pdf_bytes, file_name=os.path.basename(pdf_path),
+                            model_version=mineru_model,
+                        )
+                        layout = parse_layout_from_zip(zip_bytes)
+                    finally:
+                        await client.close()
+                    task_store.add_log(task_id, f"MinerU fallback: parsed {len(layout)} pages")
+                    output_pdf = pdf_path + ".mineru.pdf"
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, embed_api_text_layer, pdf_path, output_pdf, layout)
+                    if os.path.exists(output_pdf) and os.path.getsize(output_pdf) > 0:
+                        os.replace(output_pdf, pdf_path)
+                        report["ocr_done"] = True
+                        task_store.add_log(task_id, "MinerU OCR complete (fallback: block-level layout)")
+                    else:
+                        task_store.add_log(task_id, "MinerU fallback: embedding produced empty or missing output file")
+                    await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                    return report
+
+                total_boxes = sum(len(v) for v in surya_boxes.values())
+                task_store.add_log(task_id, f"MinerU: Surya detected {total_boxes} boxes across {len(surya_boxes)} pages")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 20, "detail": f"Surya: {total_boxes} boxes"})
+
+                # Step 2: Pre-flight + chunked MinerU API
+                from backend.engine.pdf_utils import get_pdf_info, split_pdf, cleanup_chunks
+                pages, fsize = get_pdf_info(pdf_path)
+                MAX_PAGES = 200
+                MAX_SIZE = 200 * 1024 * 1024
+
+                if fsize > MAX_SIZE:
+                    task_store.add_log(task_id, f"MinerU: file too large ({fsize//1024//1024}MB > 200MB), aborting")
+                    await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                    return report
+
+                pdf_chunks = split_pdf(pdf_path, max_pages=100) if pages > MAX_PAGES else [pdf_path]
+                if len(pdf_chunks) > 1:
+                    task_store.add_log(task_id, f"MinerU: PDF {pages} pages, split into {len(pdf_chunks)} chunks")
+
+                all_layouts = []
+                for ci, chunk_path in enumerate(pdf_chunks):
+                    n = len(pdf_chunks)
+                    pct = 25 + int(ci * 55 / max(n, 1))
+                    await _emit(task_id, "step_progress", {"step": "ocr", "progress": pct, "detail": f"MinerU: chunk {ci+1}/{n}"})
+                    task_store.add_log(task_id, f"MinerU: chunk {ci+1}/{n} ({os.path.basename(chunk_path)})")
+
+                    client = MinerUClient(token=mineru_token)
+                    try:
+                        with open(chunk_path, "rb") as f:
+                            chunk_bytes = f.read()
+                        zip_bytes = await client.process_pdf(
+                            chunk_bytes, file_name=os.path.basename(chunk_path),
+                            model_version=mineru_model,
+                        )
+                        all_layouts.append(parse_layout_from_zip(zip_bytes))
+                    finally:
+                        await client.close()
+
+                # Merge layouts with page offset
+                layout = {}
+                for ci, chunk_layout in enumerate(all_layouts):
+                    offset = ci * 100
+                    for pg, blocks in chunk_layout.items():
+                        layout[pg + offset] = blocks
+
+                cleanup_chunks(pdf_chunks, pdf_path)
+
+                total_blocks = sum(len(v) for v in layout.values())
+                task_store.add_log(task_id, f"MinerU: API returned {len(layout)} pages, {total_blocks} text blocks")
+
+                # Step 3: Spatial allocation — map MinerU block text to Surya line boxes
+                page_texts = allocate_text_to_surya_boxes(surya_boxes, layout)
+                total_text = sum(len(t) for v in page_texts.values() for t in v if t)
+                all_boxes_count = sum(len(v) for v in page_texts.values())
+                matched = sum(1 for v in page_texts.values() for t in v if t)
+                task_store.add_log(task_id, f"MinerU: spatial allocation: {matched}/{all_boxes_count} boxes received text ({total_text} chars)")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 85, "detail": f"{matched} boxes matched"})
+
+                # Step 4: Embed with Surya bboxes
+                output_pdf = pdf_path + ".mineru.pdf"
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, embed_with_surya_boxes,
+                    pdf_path, output_pdf, surya_boxes, page_texts,
+                )
+
+                if os.path.exists(output_pdf) and os.path.getsize(output_pdf) > 0:
+                    os.replace(output_pdf, pdf_path)
+                    report["ocr_done"] = True
+                    task_store.add_log(task_id, "MinerU OCR complete (hybrid: Surya boxes + MinerU text, spatial allocation)")
+                else:
+                    raise RuntimeError("MinerU: embedding produced empty file")
+
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+
+            except MinerUTimeoutError:
+                task_store.add_log(task_id, "MinerU OCR timed out")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                last_lines = "\n".join(tb.split(chr(10))[-5:])
+                task_store.add_log(task_id, f"MinerU OCR error: {e} | {last_lines}"[:500])
+
+        elif ocr_engine == "paddleocr_online":
+            paddle_token = config.get("paddleocr_online_token", "")
+            if not paddle_token:
+                task_store.add_log(task_id, "PaddleOCR online: no token configured, skipping")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                return report
+
+            paddle_mode = config.get("paddleocr_online_mode", "spatial")
+            task_store.add_log(task_id, f"PaddleOCR online ({paddle_mode}): Surya detection + PaddleOCR-VL-1.5 API")
+            await _emit(task_id, "step_progress", {"step": "ocr", "progress": 5, "detail": "Running Surya detection..."})
+
+            try:
+                from backend.engine.surya_detect import run_surya_detect, SuryaDetectError
+                from backend.engine.paddleocr_online_client import PaddleOCRClient, parse_paddleocr_blocks
+                from backend.engine.pdf_api_embed import allocate_text_to_surya_boxes, embed_with_surya_boxes
+
+                # Step 1: Surya line detection (shared by all modes)
+                try:
+                    surya_boxes = await run_surya_detect(pdf_path, dpi=200)
+                except SuryaDetectError as e:
+                    task_store.add_log(task_id, f"PaddleOCR: Surya detection failed — {e}. Falling back to block-level layout.")
+                    from backend.engine.pdf_api_embed import embed_api_text_layer
+                    client = PaddleOCRClient(token=paddle_token)
+                    try:
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        job_id = await client.submit_job_file(pdf_path, pdf_bytes)
+                        result_data = await client.poll_job(job_id, progress_callback=None)
+                        jsonl_url = result_data.get("resultUrl", {}).get("jsonUrl", "")
+                        raw_jsonl = await client.download_raw_jsonl(jsonl_url)
+                        layout = parse_paddleocr_blocks(raw_jsonl)
+                    finally:
+                        await client.close()
+                    total_blocks = sum(len(v) for v in layout.values())
+                    task_store.add_log(task_id, f"PaddleOCR fallback: parsed {len(layout)} pages, {total_blocks} blocks")
+                    output_pdf = pdf_path + ".paddleocr.pdf"
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, embed_api_text_layer, pdf_path, output_pdf, layout)
+                    if os.path.exists(output_pdf) and os.path.getsize(output_pdf) > 0:
+                        os.replace(output_pdf, pdf_path)
+                        report["ocr_done"] = True
+                        task_store.add_log(task_id, "PaddleOCR online complete (fallback: block-level layout)")
+                    else:
+                        task_store.add_log(task_id, "PaddleOCR fallback: embedding produced empty or missing output file")
+                    await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+                    return report
+
+                total_boxes = sum(len(v) for v in surya_boxes.values())
+                task_store.add_log(task_id, f"PaddleOCR: Surya detected {total_boxes} boxes across {len(surya_boxes)} pages")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 20, "detail": f"Surya: {total_boxes} boxes"})
+
+                # ── Mode branch ──
+
+                if paddle_mode == "spatial":
+                    task_store.add_log(task_id, "PaddleOCR (spatial): calling API for block-level layout...")
+                    await _emit(task_id, "step_progress", {"step": "ocr", "progress": 25, "detail": "PaddleOCR-VL-1.5 API..."})
+
+                    client = PaddleOCRClient(token=paddle_token)
+                    try:
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        job_id = await client.submit_job_file(pdf_path, pdf_bytes)
+                        result_data = await client.poll_job(job_id, progress_callback=None)
+                        jsonl_url = result_data.get("resultUrl", {}).get("jsonUrl", "")
+                        if not jsonl_url:
+                            raise RuntimeError("PaddleOCR: no jsonl URL in completed job")
+                        raw_jsonl_text = await client.download_raw_jsonl(jsonl_url)
+                    finally:
+                        await client.close()
+
+                    layout = parse_paddleocr_blocks(raw_jsonl_text)
+                    page_texts = allocate_text_to_surya_boxes(surya_boxes, layout)
+                else:
+                    task_store.add_log(task_id, f"PaddleOCR ({paddle_mode}): calling API...")
+                    await _emit(task_id, "step_progress", {"step": "ocr", "progress": 25, "detail": "PaddleOCR-VL-1.5 API..."})
+
+                    client = PaddleOCRClient(token=paddle_token)
+                    try:
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        job_id = await client.submit_job_file(pdf_path, pdf_bytes)
+                        result_data = await client.poll_job(job_id, progress_callback=None)
+                        jsonl_url = result_data.get("resultUrl", {}).get("jsonUrl", "")
+                        if not jsonl_url:
+                            raise RuntimeError("PaddleOCR: no jsonl URL in completed job")
+                        raw_jsonl_text = await client.download_raw_jsonl(jsonl_url)
+                        api_layout = parse_paddleocr_blocks(raw_jsonl_text)
+                    finally:
+                        await client.close()
+
+                    if paddle_mode == "perbox":
+                        from backend.engine.pdf_api_embed import embed_with_perbox_paddleocr
+                        task_store.add_log(task_id, "PaddleOCR (perbox): running per-box crop OCR (skip body text)...")
+                        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 30, "detail": "Per-box OCR..."})
+                        loop = asyncio.get_event_loop()
+                        page_texts = await loop.run_in_executor(
+                            None, embed_with_perbox_paddleocr,
+                            pdf_path, surya_boxes, paddle_token, 200, 5, api_layout,
+                        )
+                    else:  # hybrid
+                        from backend.engine.pdf_api_embed import hybrid_perbox_with_fallback
+                        task_store.add_log(task_id, "PaddleOCR (hybrid): per-box OCR + spatial fallback...")
+                        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 30, "detail": "Hybrid OCR..."})
+                        loop = asyncio.get_event_loop()
+                        page_texts = await loop.run_in_executor(
+                            None, hybrid_perbox_with_fallback,
+                            pdf_path, surya_boxes, paddle_token, api_layout, 200, 5,
+                        )
+
+                total_text = sum(len(t) for v in page_texts.values() for t in v if t)
+                all_boxes_count = sum(len(v) for v in page_texts.values())
+                matched = sum(1 for v in page_texts.values() for t in v if t)
+                task_store.add_log(task_id, f"PaddleOCR ({paddle_mode}): {matched}/{all_boxes_count} boxes received text ({total_text} chars)")
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 85, "detail": f"{matched} boxes matched"})
+
+                # Step 4: Embed with Surya bboxes (shared)
+                output_pdf = pdf_path + ".paddleocr.pdf"
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, embed_with_surya_boxes,
+                    pdf_path, output_pdf, surya_boxes, page_texts,
+                )
+
+                if os.path.exists(output_pdf) and os.path.getsize(output_pdf) > 0:
+                    os.replace(output_pdf, pdf_path)
+                    report["ocr_done"] = True
+                    task_store.add_log(task_id, f"PaddleOCR online complete ({paddle_mode}: Surya boxes + PaddleOCR text)")
+                else:
+                    raise RuntimeError("PaddleOCR: embedding produced empty file")
+
+                await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+
+            except asyncio.TimeoutError:
+                task_store.add_log(task_id, "PaddleOCR online timed out")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                last_lines = "\n".join(tb.split(chr(10))[-5:])
+                task_store.add_log(task_id, f"PaddleOCR online error: {e} | {last_lines}"[:500])
+
+        await _emit(task_id, "step_progress", {"step": "ocr", "progress": 100})
+    except FileNotFoundError:
+        task_store.add_log(task_id, "ocrmypdf not found in PATH — ocrmypdf 未安装: pip install ocrmypdf, 或见设置页→OCR→安装指引。"
+                           " 注意: ocrmypdf 默认使用 Tesseract 引擎，需额外安装 tesseract.exe")
+    except Exception as e:
+        task_store.add_log(task_id, f"OCR error: {e}")
+
+    # PDF compression (pikepdf BW binarization, replaces qpdf structural compression)
+    if report.get("ocr_done") and config.get("pdf_compress", False):
+        if report.get("pdf_path") and os.path.exists(report["pdf_path"]):
+            task_store.add_log(task_id, "Compressing PDF (BW binarization)...")
+            try:
+                half_res = config.get("pdf_compress_half", True)
+                output_path = report["pdf_path"] + ".bw"
+
+                loop = asyncio.get_event_loop()
+
+                def _compress_progress(page, total):
+                    pct = int(page * 100 / total)
+                    asyncio.run_coroutine_threadsafe(
+                        _emit(task_id, "step_progress", {
+                            "step": "compress",
+                            "progress": pct,
+                            "detail": f"BW compress: {page}/{total} pages",
+                        }),
+                        loop,
+                    )
+
+                from engine.pdf_bw_compress import bw_compress_pdf_blocking
+                before, after = await loop.run_in_executor(
+                    None,
+                    bw_compress_pdf_blocking,
+                    report["pdf_path"],
+                    output_path,
+                    half_res,
+                    128,
+                    _compress_progress,
+                )
+                # Save OCR original before replacing with compressed version
+                ocr_original = report["pdf_path"] + ".ocr"
+                shutil.copy2(report["pdf_path"], ocr_original)
+                task_store.add_log(task_id, f"OCR original preserved: {ocr_original}")
+                os.replace(output_path, report["pdf_path"])
+                saved_pct = round((1 - after / before) * 100, 1)
+                task_store.add_log(
+                    task_id,
+                    f"BW compression: {before/1024/1024:.1f}MB → {after/1024/1024:.1f}MB "
+                    f"({saved_pct}% saved, {'half' if half_res else 'full'} resolution)",
+                )
+            except Exception as e:
+                task_store.add_log(task_id, f"BW compression failed: {str(e)[:200]}")
+                task_store.add_log(task_id, "BW压缩失败不影响输出——OCR生成的PDF已保留原始质量，可在设置中关闭「PDF压缩」跳过此步骤")
+                try:
+                    bw_file = report["pdf_path"] + ".bw"
+                    if os.path.exists(bw_file):
+                        os.remove(bw_file)
+                except Exception:
+                    pass
+
+    return report
+
+
+async def _step_bookmark(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    task_store.add_log(task_id, "Step 6/7: Processing bookmarks/TOC...")
+    await _emit(task_id, "step_progress", {"step": "bookmark", "progress": 0})
+
+    bookmark = task.get("bookmark", "") or report.get("bookmark", "")
+    pdf_path = report.get("pdf_path", "")
+
+    if bookmark:
+        src = "user" if task.get("bookmark") else f"Step2 ({'+'.join(k for k,v in report.get('raw_sources',{}).items() if v) or 'merged'})"
+        task_store.add_log(task_id, f"Bookmark from {src}: {len(bookmark)} chars")
+
+    # ── Confirmation dialog (if enabled in settings) ──
+    if config.get("bookmark_confirm_enabled", False):
+        config_info = {
+            "外源书签": "已提供" if bookmark else "自动获取",
+            "ISBN": report.get("isbn", "") or "未获取",
+            "智能TOC": "已启用" if pdf_path else "无PDF",
+        }
+        confirmed = await _wait_for_step_confirmation(
+            task_id=task_id,
+            step_name="bookmark",
+            step_label="目录处理",
+            config_info=config_info,
+        )
+        if not confirmed:
+            await _emit(task_id, "step_progress", {"step": "bookmark", "progress": 100})
+            return report
+
+    # ── If no bookmark from Step 2, open TOCModal for manual selection ──
+    if not bookmark and pdf_path and os.path.exists(pdf_path):
+        task_store.add_log(task_id, "请在弹出的智能目录窗口中手动选择目录页并确认偏移量")
+        # Initialize flag BEFORE broadcast to prevent race: frontend could set True before we init to False
+        task_store.update(task_id, {"_toc_done": False})
+        await ws_manager.broadcast_all({
+            "type": "show_toc_modal",
+            "task_id": task_id,
+            "pdf_path": pdf_path,
+            "output_dir": config.get("finished_dir", "") or config.get("download_dir", ""),
+        })
+        await _emit_progress(task_id, "bookmark", 30, "等待智能目录确认...")
+
+        # Poll for user completion
+        _timeout_iters = 300  # 10 min at 2s interval
+        for _ in range(_timeout_iters):
+            _t = task_store.get(task_id)
+            if not _t or _t.get("status") == STATUS_CANCELLED:
+                task_store.add_log(task_id, "Task cancelled during TOC wait")
+                task_store.update(task_id, {"_toc_done": False})
+                return report
+            if _t.get("_toc_done"):
+                task_store.add_log(task_id, "智能目录已由用户确认注入")
+                report["bookmark_applied"] = True
+                task_store.update(task_id, {"_toc_done": False})
+                break
+            await asyncio.sleep(2)
+        else:
+            task_store.add_log(task_id, "智能目录确认超时，跳过书签注入")
+            task_store.update(task_id, {"_toc_done": False})
+
+    if bookmark and pdf_path and os.path.exists(pdf_path):
+        task_store.add_log(task_id, "Applying bookmark to PDF...")
+        try:
+            from addbookmark.bookmark_injector import inject_bookmarks
+            inject_bookmarks(pdf_path, bookmark, pdf_path, offset=0)
+            task_store.add_log(task_id, "Bookmark applied to PDF")
+            report["bookmark_applied"] = True
+        except ImportError:
+            task_store.add_log(task_id, "Bookmark injector module not available")
+        except Exception as e:
+            task_store.add_log(task_id, f"Bookmark apply error: {e}")
+
+    await _emit(task_id, "step_progress", {"step": "bookmark", "progress": 100})
+    return report
+
+
+async def _step_finalize(task_id: str, task: Dict[str, Any], config: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    task_store.add_log(task_id, "Step 7/7: Finalizing...")
+    await _emit(task_id, "step_progress", {"step": "finalize", "progress": 0})
+
+    pdf_path = report.get("pdf_path", "")
+    download_dir = config.get("download_dir", "")
+    finished_dir = config.get("finished_dir", "")
+
+    # ── Apply filename template ──
+    template = config.get("filename_template", "").strip()
+    if template and "{" in template and pdf_path and os.path.exists(pdf_path):
+        try:
+            from engine.filename_template import apply_template
+            new_name = apply_template(template, report)
+            if new_name:
+                new_path = os.path.join(os.path.dirname(pdf_path), new_name)
+                if os.path.abspath(new_path) != os.path.abspath(pdf_path):
+                    if os.path.exists(new_path):
+                        os.remove(new_path)
+                    os.rename(pdf_path, new_path)
+                    pdf_path = new_path
+                    report["pdf_path"] = pdf_path
+                    task_store.add_log(task_id, f"File renamed: {os.path.basename(pdf_path)}")
+        except Exception as e:
+            task_store.add_log(task_id, f"File rename failed: {e}")
+
+    if pdf_path and os.path.exists(pdf_path):
+        target_dir = finished_dir or download_dir
+        if not target_dir:
+            task_store.add_log(task_id, "No output directory configured, keeping PDF in place")
+        else:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                ext = os.path.splitext(pdf_path)[1] or ".pdf"
+                ss_code = report.get("ss_code", "")
+                title = report.get("title", "book")
+                safe_title = re.sub(r'[<>:"/\\|?*]', '_', title).strip()[:80]
+                ocr_done = report.get("ocr_done")
+                bw_done = ocr_done and config.get("pdf_compress", False)
+                if bw_done:
+                    ocr_suffix = "_ocr_bw"
+                elif ocr_done:
+                    ocr_suffix = "_ocr"
+                else:
+                    ocr_suffix = ""
+                if ss_code:
+                    new_name = f"{ss_code}_{safe_title}{ocr_suffix}{ext}"
+                else:
+                    new_name = f"{safe_title}{ocr_suffix}{ext}"
+                dest_pdf = os.path.join(target_dir, new_name)
+                moved = False
+                if os.path.abspath(pdf_path) != os.path.abspath(dest_pdf):
+                    if os.path.exists(dest_pdf):
+                        os.remove(dest_pdf)
+                    shutil.move(pdf_path, dest_pdf)
+                    moved = True
+                    report["pdf_path"] = dest_pdf
+                    task_store.add_log(task_id, f"PDF saved: {dest_pdf}")
+                if moved or os.path.abspath(pdf_path) == os.path.abspath(dest_pdf):
+                    task_store.add_log(task_id, f"任务输出: {dest_pdf}")
+                # Also move the preserved OCR original if BW compression was used
+                ocr_copy = pdf_path + ".ocr"
+                if os.path.exists(ocr_copy):
+                    ocr_name = f"{ss_code}_{safe_title}_ocr{ext}" if ss_code else f"{safe_title}_ocr{ext}"
+                    ocr_dest = os.path.join(target_dir, ocr_name)
+                    if os.path.exists(ocr_dest):
+                        os.remove(ocr_dest)
+                    shutil.move(ocr_copy, ocr_dest)
+                    task_store.add_log(task_id, f"OCR 原稿已保存: {ocr_dest}")
+            except Exception as e:
+                task_store.add_log(task_id, f"Finalize move error: {e}")
+
+    tmp_dir = report.get("tmp_dir", "")
+    if tmp_dir and os.path.exists(tmp_dir):
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            task_store.add_log(task_id, "Temporary files cleaned up")
+        except Exception:
+            pass
+
+    report["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    task_store.add_log(task_id, "Task completed successfully!")
+
+    await _emit(task_id, "step_progress", {"step": "finalize", "progress": 100})
+    return report
+
+
+async def run_pipeline(task_id: str):
+    config = get_config()
+    task = task_store.get(task_id)
+    if not task:
+        return
+
+    task_status = task.get("status")
+    if task_status == STATUS_CANCELLED:
+        return
+
+    # When resuming a paused task, skip already-completed steps
+    _prev_step = task.get("current_step", "")
+    _prev_report = task.get("report", {})
+    if _prev_step and _prev_step not in ("", "starting", "fetch_metadata"):
+        report = _prev_report
+        _start_from = PIPELINE_STEPS.index(_prev_step) if _prev_step in PIPELINE_STEPS else 0
+        task_store.add_log(task_id, f"↩ 从步骤 {_start_from + 1}/7 ({_prev_step}) 恢复")
+    else:
+        _start_from = 0
+        report = {}
+    task_store.update(task_id, {"status": STATUS_RUNNING})
+    await _emit(task_id, "task_started", {"task_id": task_id})
+
+    # Log current settings at pipeline start
+    db_path = config.get("ebook_db_path", "") or "未设置"
+    proxy = config.get("http_proxy", "") or "无"
+    ocr_engine = config.get("ocr_engine", "tesseract")
+    ocr_langs = config.get("ocr_languages", "chi_sim+eng")
+    ocr_jobs = config.get("ocr_jobs", 1)
+    ocr_timeout = config.get("ocr_timeout", 3600)
+    task_store.add_log(task_id, f"⚙ 数据库: {db_path} | 代理: {proxy}")
+    task_store.add_log(task_id, f"⚙ OCR引擎: {ocr_engine} | 语言: {ocr_langs} | 线程: {ocr_jobs} | 超时: {ocr_timeout}s")
+    # Log download source from task
+    source = task.get("source", "未知")
+    task_store.add_log(task_id, f"⚙ 下载源: {source}")
+
+    report = {}
+
+    try:
+        for step_idx, step_name in enumerate(PIPELINE_STEPS):
+            if step_idx < _start_from:
+                continue
+            task = task_store.get(task_id)
+            if not task or task.get("status") in (STATUS_CANCELLED, STATUS_FAILED):
+                if task and task.get("status") == STATUS_FAILED:
+                    task_store.add_log(task_id, f"Task failed: {task.get('error', 'unknown')}")
+                elif task and task.get("status") == STATUS_CANCELLED:
+                    task_store.add_log(task_id, "Task cancelled")
+                    task_store.update(task_id, {"status": STATUS_CANCELLED})
+                await _emit(task_id, "task_update", {
+                    "task_id": task_id,
+                    "status": task.get("status", STATUS_FAILED) if task else STATUS_FAILED,
+                })
+                return
+
+            # Wait if paused
+            if task.get("status") == STATUS_PAUSED:
+                cancelled = await _check_paused(task_id)
+                if cancelled:
+                    return
+
+            task_store.update(task_id, {"current_step": step_name, "progress": int((step_idx / 7) * 100)})
+
+            step_func = {
+                "fetch_metadata": _step_fetch_metadata,
+                "fetch_isbn": _step_fetch_isbn,
+                "download_pages": _step_download_pages,
+                "convert_pdf": _step_convert_pdf,
+                "ocr": _step_ocr,
+                "bookmark": _step_bookmark,
+                "finalize": _step_finalize,
+            }.get(step_name)
+
+            if step_func:
+                report = await step_func(task_id, task, config, report)
+                if report is None:
+                    report = {}
+
+            task_store.update(task_id, {"report": report, "progress": int(((step_idx + 1) / 7) * 100)})
+            await _emit(task_id, "task_update", {
+                "task_id": task_id,
+                "current_step": step_name,
+                "progress": int(((step_idx + 1) / 7) * 100),
+            })
+
+            await asyncio.sleep(0.1)
+
+        task_store.update(task_id, {
+            "status": STATUS_COMPLETED,
+            "progress": 100,
+            "report": report,
+        })
+        await _emit(task_id, "task_completed", {"task_id": task_id})
+
+    except Exception as e:
+        import traceback
+        error_msg = f"{e}\n{traceback.format_exc()}"
+        task_store.add_log(task_id, f"Pipeline error: {e}")
+        task_store.update(task_id, {
+            "status": STATUS_FAILED,
+            "error": str(e),
+            "report": report,
+        })
+        await _emit(task_id, "task_failed", {"task_id": task_id, "error": str(e)})
+
