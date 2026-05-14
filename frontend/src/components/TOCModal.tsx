@@ -7,9 +7,10 @@ interface Props {
   onCancel: () => void
   taskId?: string
   outputDir?: string
+  isDocker?: boolean
 }
 
-export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir }: Props) {
+export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir, isDocker }: Props) {
   const [stage, setStage] = useState<'select' | 'extracting' | 'preview' | 'injecting' | 'done'>('select')
   const [injectMsg, setInjectMsg] = useState('')
   const [startPage, setStartPage] = useState(0)
@@ -353,10 +354,28 @@ export default function TOCModal({ pdfPath, visible, onCancel, taskId, outputDir
             <div className="text-4xl mb-3">✅</div>
             <p className="text-sm font-medium text-green-700 dark:text-green-300 mb-6">{injectMsg}</p>
             <div className="flex justify-center gap-3">
-              <button onClick={() => fetch('/api/v1/toc/open-pdf', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pdf_path: pdfPath }) })}
-                className="px-4 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700">
-                打开 PDF
-              </button>
+              {isDocker ? (
+                <button onClick={async () => {
+                  const response = await fetch('/api/v1/toc/open-pdf', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pdf_path: pdfPath }) })
+                  const blob = await response.blob()
+                  const url = URL.createObjectURL(blob)
+                  const a = document.createElement('a')
+                  a.href = url
+                  a.download = pdfPath.split(/[/\\]/).pop() || 'download.pdf'
+                  document.body.appendChild(a)
+                  a.click()
+                  document.body.removeChild(a)
+                  URL.revokeObjectURL(url)
+                }}
+                  className="px-4 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700">
+                  下载文件
+                </button>
+              ) : (
+                <button onClick={() => fetch('/api/v1/toc/open-pdf', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pdf_path: pdfPath }) })}
+                  className="px-4 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700">
+                  打开 PDF
+                </button>
+              )}
               <button onClick={() => {
                 const dir = outputDir || pdfPath
                 fetch('/api/v1/toc/open-folder', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pdf_path: dir }) })

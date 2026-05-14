@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { LLM_OCR_RECOMMENDED } from '../constants'
+import { useStore } from '../stores/useStore'
 
 interface AppConfig {
   host: string
@@ -350,6 +351,7 @@ const AI_VISION_PROVIDERS = [
 
 export default function ConfigSettings() {
   const { openTocModal } = useOutletContext<{ openTocModal: (pdfPath: string, taskId?: string) => void }>()
+  const isDocker = useStore(s => s.isDocker)
   const [config, setConfig] = useState<AppConfig | null>(null)
   const [form, setForm] = useState<AppConfig>({ ...DEFAULT_CONFIG })
   const [loading, setLoading] = useState(true)
@@ -427,6 +429,11 @@ export default function ConfigSettings() {
   const handleCheckUpdate = async () => {
     setUpdateChecking(true)
     setUpdateResult('')
+    if (isDocker) {
+      setUpdateResult('Docker 版本请使用 docker compose pull && docker compose up -d 升级')
+      setUpdateChecking(false)
+      return
+    }
     try {
       const res = await fetch('/api/v1/check-update')
       const data = await res.json()

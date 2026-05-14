@@ -12,6 +12,7 @@ interface AppState {
   availableDbs: string[]
   loading: boolean
   error: string
+  isDocker: boolean
 
   fetchConfig: () => Promise<void>
   updateConfig: (data: Partial<AppConfig>) => Promise<void>
@@ -20,6 +21,7 @@ interface AppState {
   fetchAvailableDbs: () => Promise<void>
   setLoading: (v: boolean) => void
   setError: (e: string) => void
+  setDocker: (v: boolean) => void
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -31,6 +33,7 @@ export const useStore = create<AppState>((set, get) => ({
   availableDbs: [],
   loading: false,
   error: '',
+  isDocker: false,
 
   fetchConfig: async () => {
     try {
@@ -91,4 +94,5 @@ export const useStore = create<AppState>((set, get) => ({
 
   setLoading: (v) => set({ loading: v }),
   setError: (e) => set({ error: e }),
+  setDocker: (v) => set({ isDocker: v }),
 }))

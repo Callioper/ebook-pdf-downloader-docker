@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { API_BASE } from '../constants'
+import { useStore } from '../stores/useStore'
 import { playNotificationSound } from '../utils/sound'
 import ConfirmDownloadModal from './ConfirmDownloadModal'
 import ConfirmStepModal from './ConfirmStepModal'
@@ -22,6 +23,8 @@ let cachedVersion = APP_VERSION
 export default function Layout() {
   const location = useLocation()
   const isTaskDetail = location.pathname.startsWith('/tasks/') && location.pathname !== '/tasks'
+  const setDocker = useStore(s => s.setDocker)
+  const isDocker = useStore(s => s.isDocker)
   const [version, setVersion] = useState(cachedVersion)
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [dismissed, setDismissed] = useState(false)
@@ -120,6 +123,12 @@ export default function Layout() {
   useEffect(() => {
     const init = async () => {
       const tasks = [
+        // 0. Docker detection
+        fetch('/api/v1/health')
+          .then(r => r.json())
+          .then(data => { if (data.docker) setDocker(true) })
+          .catch(() => {}),
+
         // 1. Theme
         fetch('/api/v1/config')
           .then(r => r.json())
@@ -316,7 +325,9 @@ export default function Layout() {
             新版本 v{updateInfo.latest} 可用
           </span>
           <div className="flex items-center gap-2">
-            {downloading ? (
+            {isDocker ? (
+              <span className="text-xs text-white/80">Docker 版本请使用 docker compose pull &amp;&amp; docker compose up -d 升级</span>
+            ) : downloading ? (
               <div className="flex items-center gap-2">
                 <div className="w-24 h-1.5 bg-white/30 rounded-full overflow-hidden">
                   <div className="h-full bg-white rounded-full transition-all" style={{ width: `${downloadingPct}%` }} />
@@ -395,7 +406,7 @@ export default function Layout() {
 
       <main className="flex-1">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-          <Outlet context={{ openTocModal }} />
+          <Outlet context={{ openTocModal, isDocker }} />
           <ConfirmDownloadModal />
           <ConfirmStepModal />
           {tocPdfPath && (
@@ -405,6 +416,7 @@ export default function Layout() {
               taskId={tocTaskId}
               outputDir={tocOutputDir}
               onCancel={closeTocModal}
+              isDocker={isDocker}
             />
           )}
         </div>

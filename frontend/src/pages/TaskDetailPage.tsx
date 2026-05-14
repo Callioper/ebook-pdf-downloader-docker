@@ -5,6 +5,7 @@ import { API_BASE, PIPELINE_STEPS, STATUS_LABELS } from '../constants'
 import type { TaskItem, AppConfig, WSMessage } from '../types'
 import { statusBadge } from '../utils/statusBadge'
 import { useTaskWebSocket } from '../hooks/useTaskWebSocket'
+import { useStore } from '../stores/useStore'
 import StepProgressBar from '../components/StepProgressBar'
 import LogStream from '../components/LogStream'
 import TaskReport from '../components/TaskReport'
@@ -16,6 +17,7 @@ import PDFPreviewPanel from '../components/PDFPreviewPanel'
 export default function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>()
   const navigate = useNavigate()
+  const isDocker = useStore(s => s.isDocker)
   const [task, setTask] = useState<TaskItem | null>(null)
   const [loading, setLoading] = useState(true)
   const [starting, setStarting] = useState(false)
@@ -152,6 +154,23 @@ export default function TaskDetailPage() {
 
   const handleOpenPdf = async () => {
     if (!taskId) return
+    if (isDocker) {
+      try {
+        const response = await axios.get(`${API_BASE}/tasks/${taskId}/open`, { responseType: 'blob' })
+        const url = URL.createObjectURL(response.data)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = task?.report?.output_file?.split(/[/\\]/).pop() || task?.title || 'download.pdf'
+        a.download = a.download.replace(/\.pdf$/i, '') + '.pdf'
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+      } catch (e: any) {
+        alert('无法下载文件: ' + (e.message || ''))
+      }
+      return
+    }
     try {
       await axios.get(`${API_BASE}/tasks/${taskId}/open`)
     } catch (e: any) {
@@ -279,7 +298,7 @@ export default function TaskDetailPage() {
                 onClick={handleOpenPdf}
                 className="px-4 py-1.5 bg-green-600 text-white text-sm rounded-md hover:bg-green-700"
               >
-                打开PDF
+                {isDocker ? '下载文件' : '打开PDF'}
               </button>
             )}
             {task.status === 'completed' && (
