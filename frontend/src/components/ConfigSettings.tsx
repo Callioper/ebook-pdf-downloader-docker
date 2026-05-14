@@ -1600,15 +1600,28 @@ export default function ConfigSettings() {
       {expanded.proxy && (
         <div className="bg-gray-50 rounded-lg border border-gray-200 p-4 space-y-3">
           <div>
-            <label className="block text-xs font-medium text-gray-600 mb-1">HTTP 代理地址（可选）</label>
-            <input
-              type="text"
-              value={form.http_proxy || ''}
-              onChange={(e) => updateForm({ http_proxy: e.target.value })}
-              placeholder="http://127.0.0.1:10809"
-              spellCheck={false}
-              className="w-full rounded border border-gray-300 px-2 py-1.5 text-xs font-mono focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            />
+            <label className="block text-xs font-medium text-gray-600 mb-1">HTTP 代理{isDocker ? '端口' : '地址（可选）'}</label>
+            {isDocker ? (
+              <div className="flex items-center">
+                <span className="px-2 py-1.5 text-xs font-mono bg-gray-200 border border-gray-300 rounded-l text-gray-600">http://host.docker.internal:</span>
+                <input
+                  type="text"
+                  value={(form.http_proxy || '').replace('http://host.docker.internal:', '')}
+                  onChange={(e) => updateForm({ http_proxy: e.target.value ? 'http://host.docker.internal:' + e.target.value : '' })}
+                  placeholder="7890"
+                  className="w-20 rounded-r border border-gray-300 border-l-0 px-2 py-1.5 text-xs font-mono focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                />
+              </div>
+            ) : (
+              <input
+                type="text"
+                value={form.http_proxy || ''}
+                onChange={(e) => updateForm({ http_proxy: e.target.value })}
+                placeholder="http://127.0.0.1:10809"
+                spellCheck={false}
+                className="w-full rounded border border-gray-300 px-2 py-1.5 text-xs font-mono focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              />
+            )}
           </div>
 
           <div className="flex items-center gap-2">
