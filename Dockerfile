@@ -19,8 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     git \
     curl \
-    && apt-get purge -y git \
-    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1
@@ -42,10 +40,13 @@ RUN python3 -m venv /app/venv-paddle311 && \
     ocrmypdf \
     ocrmypdf_paddleocr
 
-# Clone and setup local-llm-pdf-ocr
+# Clone and setup local-llm-pdf-ocr (git is still installed here)
 RUN git clone --depth 1 https://github.com/Callioper/local-llm-pdf-ocr.git /app/local-llm-pdf-ocr && \
     cd /app/local-llm-pdf-ocr && \
     uv sync
+
+# Remove git after clone to reduce image size
+RUN apt-get purge -y git && apt-get autoremove -y
 
 COPY backend/ ./backend/
 COPY config.default.json ./config.default.json
