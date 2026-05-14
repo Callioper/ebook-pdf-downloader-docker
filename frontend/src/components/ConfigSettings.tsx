@@ -1138,31 +1138,28 @@ export default function ConfigSettings() {
       {/* ============ 数据库 ============ */}
       <SectionHeader
         title="数据库"
-        summary={<><StatusDot status={dbStatus} /> {dbStatus === 'green' && dbNames.length > 0 ? `已连接 ${dbNames.join(', ')}` : dbStatus === 'red' ? '未连接' : dbStatus === 'yellow' ? '已连接(空)' : '检测中...'}</>}
+        summary={<div className="flex items-center gap-2"><StatusDot status={dbStatus} /> {dbStatus === 'green' && dbNames.length > 0 ? `已连接 ${dbNames.join(', ')}` : dbStatus === 'red' ? '未连接' : dbStatus === 'yellow' ? '已连接(空)' : '检测中...'}{isDocker && <span className="text-gray-400"> · /db</span>}{isDocker && <button type="button" onClick={checkDbConnectivity} className="ml-2 px-2 py-0.5 text-xs rounded border border-gray-300 bg-white hover:bg-gray-100 text-gray-600">重新检测</button>}</div>}
         color="blue"
         expanded={expanded.database}
         onToggle={() => toggleSection('database')}
       />
       {expanded.database && (
         <div className="bg-gray-50 rounded-lg border border-gray-200 p-4 space-y-3">
+          {!isDocker && (
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">SQLite 数据库路径</label>
             <div className="flex items-center gap-2">
               <div className="flex-1">
-                {isDocker ? (
-                  <input type="text" value={form.ebook_db_path || '/db'} onChange={(e) => updateForm({ ebook_db_path: e.target.value })}
-                    className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded bg-gray-50" placeholder="/db" />
-                ) : (
-                  <FolderPicker
-                    value={form.ebook_db_path || ''}
-                    onChange={(v) => updateForm({ ebook_db_path: v })}
-                    placeholder="选择数据库目录..."
-                  />
-                )}
+                <FolderPicker
+                  value={form.ebook_db_path || ''}
+                  onChange={(v) => updateForm({ ebook_db_path: v })}
+                  placeholder="选择数据库目录..."
+                />
               </div>
               <StatusDot status={dbStatus} />
             </div>
           </div>
+          )}
 
           {!isDocker && (
           <div className="flex items-center gap-2">
@@ -1205,40 +1202,34 @@ export default function ConfigSettings() {
       {/* ============ 下载 ============ */}
       <SectionHeader
         title="下载"
-        summary={<><StatusDot status={form.download_dir ? 'green' : 'yellow'} /> {form.download_dir ? '已设置' : '请设置下载目录'}</>}
+        summary={isDocker ? <span className="text-gray-400">/downloads · /finished</span> : <><StatusDot status={form.download_dir ? 'green' : 'yellow'} /> {form.download_dir ? '已设置' : '请设置下载目录'}</>}
         color="blue"
         expanded={expanded.download}
         onToggle={() => toggleSection('download')}
       />
       {expanded.download && (
         <div className="bg-gray-50 rounded-lg border border-gray-200 p-4 space-y-3">
+          {!isDocker && (
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">下载目录 (PDF 临时存放)</label>
-            {isDocker ? (
-              <input type="text" value={form.download_dir || '/downloads'} onChange={(e) => updateForm({ download_dir: e.target.value })}
-                className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded bg-gray-50" placeholder="/downloads" />
-            ) : (
-              <FolderPicker
-                value={form.download_dir || ''}
-                onChange={(v) => updateForm({ download_dir: v })}
-                placeholder="下载临时目录..."
-              />
-            )}
+            <FolderPicker
+              value={form.download_dir || ''}
+              onChange={(v) => updateForm({ download_dir: v })}
+              placeholder="下载临时目录..."
+            />
           </div>
+          )}
 
+          {!isDocker && (
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">完成目录 (最终输出)</label>
-            {isDocker ? (
-              <input type="text" value={form.finished_dir || '/finished'} onChange={(e) => updateForm({ finished_dir: e.target.value })}
-                className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded bg-gray-50" placeholder="/finished" />
-            ) : (
-              <FolderPicker
-                value={form.finished_dir || ''}
-                onChange={(v) => updateForm({ finished_dir: v })}
-                placeholder="完成输出目录..."
-              />
-            )}
+            <FolderPicker
+              value={form.finished_dir || ''}
+              onChange={(v) => updateForm({ finished_dir: v })}
+              placeholder="完成输出目录..."
+            />
           </div>
+          )}
 
           {/* 文件名模板 */}
           <div>
