@@ -5,11 +5,11 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /share/Public/ebook/downloads:/downloads
-      - /share/Public/ebook/finished:/finished
-      - /share/Public/ebook/tmp:/tmp/bdw
-      - /share/Public/ebook/db:/db
-      - ebook_config:/app/data
+      - ./downloads:/downloads
+      - ./finished:/finished
+      - ./tmp:/tmp/bdw
+      - ./db:/db
+      - config_data:/app/data
     restart: unless-stopped
 
   stacks:
@@ -18,7 +18,7 @@ services:
     ports:
       - "7788:7788"
     volumes:
-      - /share/Public/ebook/db:/data
+      - ./db:/data
     restart: unless-stopped
 
   flaresolverr:
@@ -31,4 +31,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  ebook_config:
+  config_data:
