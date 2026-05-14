@@ -14,7 +14,6 @@
 | Registry | 适用 | 命令 |
 |----------|------|------|
 | **阿里云 ACR**（推荐） | 国内，秒级拉取 | `docker pull crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest` |
-| **Docker Hub** | 通用 | `docker pull 407811164/ebook-pdf-downloader-docker:latest` |
 | **GitHub GHCR** | 国际 | `docker pull ghcr.io/callioper/ebook-pdf-downloader-docker:latest` |
 
 ---
@@ -40,11 +39,11 @@ services:
       - /volume1/docker/ebook/downloads:/downloads
       - /volume1/docker/ebook/finished:/finished
       - /volume1/docker/ebook/tmp:/tmp/bdw
-      - ebook_config:/app/data
+      - config_data:/app/data
     restart: unless-stopped
 
 volumes:
-  ebook_config:
+  config_data:
 ```
 
 4. **下一步** → **完成**，等待拉取镜像
@@ -101,6 +100,7 @@ volumes:
 | `/downloads` | `/volume1/docker/ebook/downloads` |
 | `/finished` | `/volume1/docker/ebook/finished` |
 | `/tmp/bdw` | `/volume1/docker/ebook/tmp` |
+| `/app/data` | 选"新增存储卷" → 名称 `config_data` |
 
 4. 创建并启动 → 访问 `http://<NAS_IP>:8000`
 
@@ -113,14 +113,28 @@ volumes:
 ### 方式一：预构建镜像（推荐，无需编译）
 
 ```bash
-# 1. 创建目录
-mkdir -p ebook/{downloads,finished,tmp}
-cd ebook
+mkdir -p ebook/{downloads,finished,tmp} && cd ebook
+docker pull crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
 
-# 2. 下载 compose 文件
-curl -O https://raw.githubusercontent.com/Callioper/ebook-pdf-downloader-docker/master/docker-compose.yml
+# 创建 docker-compose.yml（不含 build，纯拉取启动）
+cat > docker-compose.yml << 'EOF'
+services:
+  app:
+    image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
+    container_name: book-downloader
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./downloads:/downloads
+      - ./finished:/finished
+      - ./tmp:/tmp/bdw
+      - config_data:/app/data
+    restart: unless-stopped
 
-# 3. 启动（镜像自动拉取）
+volumes:
+  config_data:
+EOF
+
 docker compose up -d
 ```
 
@@ -188,7 +202,7 @@ services:
 | `./downloads/` | 下载中的 PDF |
 | `./finished/` | OCR 完成的成品 |
 | `./tmp/` | 临时文件（可定期清理） |
-| `ebook_config` (volume) | 配置文件 + 任务记录 |
+| `config_data` (volume) | 配置文件 + 任务记录 |
 
 ---
 
