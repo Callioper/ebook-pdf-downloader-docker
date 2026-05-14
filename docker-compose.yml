@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  app:
+    build: .
+    image: callioper/ebook-pdf-downloader-docker:latest
+    container_name: book-downloader
+    ports:
+      - "8000:8000"
+    volumes:
+      - config_data:/app
+      - ./downloads:/downloads
+      - ./finished:/finished
+      - ./tmp:/tmp/bdw
+    environment:
+      - DOCKER=true
+    restart: unless-stopped
+
+  stacks:
+    image: ghcr.io/callioper/book-searcher:latest
+    container_name: book-searcher
+    ports:
+      - "7788:7788"
+    volumes:
+      - ./ebook-db:/data
+    restart: unless-stopped
+    profiles:
+      - full
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    profiles:
+      - full
+
+volumes:
+  config_data:
