@@ -12,13 +12,20 @@ services:
       - config_data:/app/data
     restart: unless-stopped
 
-  stacks:
+  book-searcher:
     image: ghcr.io/callioper/book-searcher:latest
     container_name: book-searcher
     ports:
-      - "7788:7788"
+      - "7789:7789"
     volumes:
       - ./db:/data
+    restart: unless-stopped
+
+  stacks:
+    image: zelestcarlyone/stacks:latest
+    container_name: stacks
+    ports:
+      - "7788:7788"
     restart: unless-stopped
 
   flaresolverr:
