@@ -10,6 +10,7 @@ services:
       - ./downloads:/downloads
       - ./finished:/finished
       - ./tmp:/tmp/bdw
+      - ./db:/db
     restart: unless-stopped
 
   stacks:

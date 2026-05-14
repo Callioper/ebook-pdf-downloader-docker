@@ -573,8 +573,9 @@ export default function ConfigSettings() {
     checkDbConnectivity()
   }, [config])
 
-  // Restore proxy state from stored config
+  // Restore proxy state from stored config (skip in Docker — proxy is optional)
   useEffect(() => {
+    if (isDocker) return
     if (!config || !form.http_proxy) return
     if (proxyChecked) return // already manually checked
     const restoreProxy = async () => {
@@ -1148,16 +1149,22 @@ export default function ConfigSettings() {
             <label className="block text-xs font-medium text-gray-600 mb-1">SQLite 数据库路径</label>
             <div className="flex items-center gap-2">
               <div className="flex-1">
-                <FolderPicker
-                  value={form.ebook_db_path || ''}
-                  onChange={(v) => updateForm({ ebook_db_path: v })}
-                  placeholder="选择数据库目录..."
-                />
+                {isDocker ? (
+                  <input type="text" value={form.ebook_db_path || '/db'} onChange={(e) => updateForm({ ebook_db_path: e.target.value })}
+                    className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded bg-gray-50" placeholder="/db" />
+                ) : (
+                  <FolderPicker
+                    value={form.ebook_db_path || ''}
+                    onChange={(v) => updateForm({ ebook_db_path: v })}
+                    placeholder="选择数据库目录..."
+                  />
+                )}
               </div>
               <StatusDot status={dbStatus} />
             </div>
           </div>
 
+          {!isDocker && (
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -1175,8 +1182,9 @@ export default function ConfigSettings() {
               重新检测
             </button>
           </div>
+          )}
 
-          {Array.isArray(detectedPaths) && detectedPaths.length > 0 && (
+          {!isDocker && Array.isArray(detectedPaths) && detectedPaths.length > 0 && (
             <div className="text-xs text-gray-500 space-y-1">
               <span className="font-medium">检测到的路径:</span>
               {detectedPaths.filter(p => p && typeof p === 'string').map((p, i) => (
@@ -1206,20 +1214,30 @@ export default function ConfigSettings() {
         <div className="bg-gray-50 rounded-lg border border-gray-200 p-4 space-y-3">
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">下载目录 (PDF 临时存放)</label>
-            <FolderPicker
-              value={form.download_dir || ''}
-              onChange={(v) => updateForm({ download_dir: v })}
-              placeholder="下载临时目录..."
-            />
+            {isDocker ? (
+              <input type="text" value={form.download_dir || '/downloads'} onChange={(e) => updateForm({ download_dir: e.target.value })}
+                className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded bg-gray-50" placeholder="/downloads" />
+            ) : (
+              <FolderPicker
+                value={form.download_dir || ''}
+                onChange={(v) => updateForm({ download_dir: v })}
+                placeholder="下载临时目录..."
+              />
+            )}
           </div>
 
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">完成目录 (最终输出)</label>
-            <FolderPicker
-              value={form.finished_dir || ''}
-              onChange={(v) => updateForm({ finished_dir: v })}
-              placeholder="完成输出目录..."
-            />
+            {isDocker ? (
+              <input type="text" value={form.finished_dir || '/finished'} onChange={(e) => updateForm({ finished_dir: e.target.value })}
+                className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded bg-gray-50" placeholder="/finished" />
+            ) : (
+              <FolderPicker
+                value={form.finished_dir || ''}
+                onChange={(v) => updateForm({ finished_dir: v })}
+                placeholder="完成输出目录..."
+              />
+            )}
           </div>
 
           {/* 文件名模板 */}

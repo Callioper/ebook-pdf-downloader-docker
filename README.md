@@ -42,6 +42,7 @@ services:
       - /volume1/docker/ebook/downloads:/downloads
       - /volume1/docker/ebook/finished:/finished
       - /volume1/docker/ebook/tmp:/tmp/bdw
+      - /volume1/docker/ebook/db:/db
       - config_data:/app/data
     restart: unless-stopped
 
@@ -103,6 +104,7 @@ volumes:
 | `/downloads` | `/volume1/docker/ebook/downloads` |
 | `/finished` | `/volume1/docker/ebook/finished` |
 | `/tmp/bdw` | `/volume1/docker/ebook/tmp` |
+| `/db` | `/volume1/docker/ebook/db` |
 | `/app/data` | 选"新增存储卷" → 名称 `config_data` |
 
 4. 创建并启动 → 访问 `http://<NAS_IP>:8000`
@@ -131,6 +133,7 @@ services:
       - ./downloads:/downloads
       - ./finished:/finished
       - ./tmp:/tmp/bdw
+      - ./db:/db
       - config_data:/app/data
     restart: unless-stopped
 
@@ -176,25 +179,41 @@ docker compose up -d
 ### 选配：本地数据库检索
 
 1. 从 [EbookDatabase](https://github.com/Hellohistory/EbookDatabase) 下载 `DX_2.0-5.0.db`
-2. 放入 `ebook-db/` 目录
-3. 如需 Stacks 搜索服务，用 `--profile full` 启动：
+2. 放入 `./db/` 目录，容器自动识别
+3. 设置页数据库路径已默认为 `/db`，无需修改
+
+### 选配：Stacks + FlareSolverr（全功能下载）
+
+如需 Anna's Archive 高速搜索和 Cloudflare 绕过，启动全服务：
+
+```bash
+# 下载 docker-compose.yml 后添加以下服务，或用仓库自带的 compose
+docker compose --profile full up -d
+```
+
+或手动在 compose 中添加：
 
 ```yaml
-services:
   stacks:
     image: ghcr.io/callioper/book-searcher:latest
+    container_name: book-searcher
     ports:
       - "7788:7788"
     volumes:
-      - ./ebook-db:/data
+      - ./db:/data
     restart: unless-stopped
-    profiles:
-      - full
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    ports:
+      - "8191:8191"
+    environment:
+      - LOG_LEVEL=info
+    restart: unless-stopped
 ```
 
 然后设置页 `stacks_base_url` 填 `http://stacks:7788`。
-
-> 不用 Stacks 也可通过 Z-Library 直接搜索下载。
 
 ---
 
@@ -205,6 +224,7 @@ services:
 | `./downloads/` | 下载中的 PDF |
 | `./finished/` | OCR 完成的成品 |
 | `./tmp/` | 临时文件（可定期清理） |
+| `./db/` | SQLite 数据库文件（放入 `DX_*.db`） |
 | `config_data` (volume) | 配置文件 + 任务记录 |
 
 ---

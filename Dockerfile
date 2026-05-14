@@ -56,7 +56,7 @@ COPY config.default.json ./config.default.json
 
 COPY --from=frontend-builder /src/dist ./frontend/dist/
 
-RUN mkdir -p /downloads /finished /tmp/bdw /app/data
+RUN mkdir -p /downloads /finished /tmp/bdw /app/data /db
 
 # Create non-root user
 RUN useradd -m -u 1000 app && chown -R app:app /app /downloads /finished /tmp/bdw
