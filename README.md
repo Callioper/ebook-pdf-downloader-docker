@@ -184,36 +184,19 @@ docker compose up -d
 
 ### 选配：Stacks + FlareSolverr（全功能下载）
 
-如需 Anna's Archive 高速搜索和 Cloudflare 绕过，启动全服务：
+已内置在 `docker-compose.yml` 中，`docker compose up -d` 默认同时启动。如需关闭：
 
 ```bash
-# 下载 docker-compose.yml 后添加以下服务，或用仓库自带的 compose
-docker compose --profile full up -d
+# 仅启动核心服务（下载+OCR）
+docker compose up -d app
+
+# 单独启动 Stacks 或 FlareSolverr
+docker compose up -d stacks flaresolverr
 ```
 
-或手动在 compose 中添加：
-
-```yaml
-  stacks:
-    image: ghcr.io/callioper/book-searcher:latest
-    container_name: book-searcher
-    ports:
-      - "7788:7788"
-    volumes:
-      - ./db:/data
-    restart: unless-stopped
-
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
-    ports:
-      - "8191:8191"
-    environment:
-      - LOG_LEVEL=info
-    restart: unless-stopped
-```
-
-然后设置页 `stacks_base_url` 填 `http://stacks:7788`。
+启动后设置页填入：
+- `stacks_base_url`: `http://stacks:7788`
+- `flaresolverr_port`: `8191`
 
 ---
 
