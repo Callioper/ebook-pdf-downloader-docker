@@ -301,7 +301,7 @@ export default function TaskDetailPage() {
                 {isDocker ? '下载文件' : '打开PDF'}
               </button>
             )}
-            {task.status === 'completed' && (
+            {task.status === 'completed' && !isDocker && (
               <button
                 onClick={handleOpenFolder}
                 className="px-4 py-1.5 border border-gray-300 text-gray-700 text-sm rounded-md hover:bg-gray-50"
