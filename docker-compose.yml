@@ -2,6 +2,9 @@ services:
   app:
     image: crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest
     container_name: book-downloader
+    depends_on:
+      stacks:
+        condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"  # 让容器能访问宿主机代理 (Clash)
     ports:
@@ -28,8 +31,14 @@ services:
     environment:
       - USERNAME=admin
       - PASSWORD=password
-      - SOLVERR_URL=flaresolverr:8191
+      - SOLVERR_URL=http://flaresolverr:8191
+      - FLARESOLVERR_ENABLED=true
       - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7788/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
     restart: unless-stopped
 
   flaresolverr:

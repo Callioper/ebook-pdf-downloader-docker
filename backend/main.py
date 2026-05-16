@@ -105,6 +105,45 @@ app.include_router(tasks_router)
 app.include_router(ws_router)
 app.include_router(toc_router)
 
+
+@app.on_event("startup")
+async def _startup_configure_stacks():
+    """Docker: auto-login Stacks and enable FlareSolverr if disabled."""
+    if not is_docker():
+        return
+    cfg = get_config()
+    url = cfg.get("stacks_base_url", "")
+    uname = cfg.get("stacks_username", "")
+    passwd = cfg.get("stacks_password", "")
+    if not url or not uname or not passwd:
+        return
+    import asyncio, httpx
+    for i in range(10):
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                lr = await c.post(f"{url}/login", json={"username": uname, "password": passwd})
+                if lr.status_code != 200:
+                    await asyncio.sleep(3)
+                    continue
+                # Check if FlareSolverr is enabled
+                cr = await c.get(f"{url}/api/config", cookies=lr.cookies)
+                if cr.status_code != 200:
+                    continue
+                scfg = cr.json()
+                if not scfg.get("flaresolverr", {}).get("enabled"):
+                    scfg["flaresolverr"]["enabled"] = True
+                    scfg["flaresolverr"]["url"] = "http://flaresolverr:8191"
+                    await c.post(f"{url}/api/config", json=scfg, cookies=lr.cookies)
+                    logger.info("Stacks: FlareSolverr auto-enabled via API")
+                else:
+                    logger.info("Stacks: FlareSolverr already enabled")
+                break
+        except Exception:
+            await asyncio.sleep(3)
+    else:
+        logger.warning("Stacks: could not auto-configure FlareSolverr after 10 attempts")
+
+
 _last_heartbeat = 0.0
 
 
