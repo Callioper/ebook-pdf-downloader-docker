@@ -459,7 +459,42 @@ async def config_status():
             pass
         return "ocr", {"ok": True, "engine": eng}
 
-    tasks = [_db(), _ocr()]
+    async def _stacks():
+        url = cfg.get("stacks_base_url", "")
+        if not url:
+            return "stacks", {"ok": False, "detail": "未配置"}
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=3) as c:
+                hr = await c.get(f"{url}/api/health")
+                if hr.status_code != 200:
+                    return "stacks", {"ok": False, "detail": f"HTTP {hr.status_code}"}
+                uname = cfg.get("stacks_username", "")
+                passwd = cfg.get("stacks_password", "")
+                if uname and passwd:
+                    lr = await c.post(f"{url}/login", json={"username": uname, "password": passwd})
+                    if lr.status_code == 200:
+                        session_cookie = lr.cookies.get("session", "")
+                        if session_cookie:
+                            from config import set_stacks_cached_session
+                            set_stacks_cached_session(session_cookie)
+                        return "stacks", {"ok": True, "detail": "已登录"}
+                    return "stacks", {"ok": False, "detail": f"登录 HTTP {lr.status_code}"}
+                return "stacks", {"ok": True, "detail": "可连接"}
+        except Exception as ex:
+            return "stacks", {"ok": False, "detail": str(ex)[:50]}
+
+    async def _flare():
+        try:
+            import httpx
+            host = "flaresolverr" if is_docker() else "localhost"
+            async with httpx.AsyncClient(timeout=2, verify=False) as c:
+                await c.get(f"http://{host}:8191")
+            return "flaresolverr", {"ok": True, "detail": f"{host}:8191"}
+        except Exception:
+            return "flaresolverr", {"ok": False, "detail": "不可达"}
+
+    tasks = [_db(), _ocr(), _stacks(), _flare()]
     results = await _aio.gather(*tasks)
     extra = dict(results)
     safe["_auto"] = extra
@@ -1194,11 +1229,10 @@ async def check_ocr(engine: str = Query(default="")):
             _venv_ok = False
             for _venv_py in _venv_candidates:
                 if os.path.exists(_venv_py):
-                    r = subprocess.run([_venv_py, "-c", "import paddleocr; print(paddleocr.__version__)"],
+                    r = subprocess.run([_venv_py, "-c", "import ocrmypdf_paddleocr"],
                                        capture_output=True, text=True, timeout=60)
                     if r.returncode == 0:
-                        ver = r.stdout.strip().split("\n")[0]
-                        return {"ok": True, "engine": "paddleocr", "version": ver if ver != "ok" else "已安装", "venv": _venv_py}
+                        return {"ok": True, "engine": "paddleocr", "version": "已安装", "venv": _venv_py}
                     _venv_ok = True  # venv exists but import failed
             if _venv_ok:
                 return {"ok": False, "engine": "paddleocr", "message": "venv 存在但 paddleocr 未安装"}
@@ -1391,7 +1425,7 @@ async def install_ocr(body: InstallOCRRequest):
 
             # Check if venv already exists and paddleocr works
             if _venv_py:
-                r_check = subprocess.run([_venv_py, "-c", "import paddleocr"],
+                r_check = subprocess.run([_venv_py, "-c", "import ocrmypdf_paddleocr"],
                                          capture_output=True, timeout=60)
                 if r_check.returncode == 0:
                     return {"ok": True, "message": "PaddleOCR venv 已就绪"}
