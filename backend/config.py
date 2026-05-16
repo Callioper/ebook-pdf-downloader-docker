@@ -48,7 +48,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "download_dir": "/downloads" if is_docker() else "",
     "finished_dir": "/finished" if is_docker() else "",
     "tmp_dir": "/tmp/bdw" if is_docker() else "",
-    "stacks_base_url": "http://localhost:7788",
+    "stacks_base_url": "http://stacks:7788" if is_docker() else "http://localhost:7788",
     "zfile_base_url": "",
     "zfile_external_url": "",
     "zfile_storage_key": "1",

@@ -1,0 +1,33 @@
+[2026-05-16 09:59:18] [INFO] [worker.coordinator-1] Coordinator process starting
+[2026-05-16 09:59:18] [INFO] [worker.download-0] Download worker download-0 starting
+[2026-05-16 09:59:18] [INFO] [worker.scraper-1] Scraper process starting
+[2026-05-16 09:59:18] [WARNING] [config] Username 'None' is invalid. Resetting back to 'admin'.
+[2026-05-16 09:59:18] [WARNING] [config] Valid password missing, resetting to default.
+[2026-05-16 09:59:18] [WARNING] [config] Username 'None' is invalid. Resetting back to 'admin'.
+[2026-05-16 09:59:18] [WARNING] [config] Valid password missing, resetting to default.
+[2026-05-16 09:59:18] [INFO] [stacks.server] Stacks server initializing...
+[2026-05-16 09:59:18] [DEBUG] [config] Loaded config schema.
+[2026-05-16 09:59:18] [DEBUG] [config] Loaded config.
+[2026-05-16 09:59:18] [DEBUG] [config] Validating config.
+[2026-05-16 09:59:18] [WARNING] [config] Username 'None' is invalid. Resetting back to 'admin'.
+[2026-05-16 09:59:18] [WARNING] [config] Valid password missing, resetting to default.
+[2026-05-16 09:59:18] [INFO] [config] Generated new 32-bit key for session_secret
+[2026-05-16 09:59:18] [WARNING] [config] FlareSolverr URL is invalid Resetting back to 'flaresolverr:8191'.
+[2026-05-16 09:59:18] [INFO] [config] Some value(s) in config file did not conform to standard. Logfile has been healed.
+[2026-05-16 09:59:18] [INFO] [config] Generated new 32-bit key for session_secret
+[2026-05-16 09:59:18] [WARNING] [config] FlareSolverr URL is invalid Resetting back to 'flaresolverr:8191'.
+[2026-05-16 09:59:18] [INFO] [config] Some value(s) in config file did not conform to standard. Logfile has been healed.
+[2026-05-16 09:59:18] [INFO] [config] Generated new 32-bit key for session_secret
+[2026-05-16 09:59:18] [WARNING] [config] FlareSolverr URL is invalid Resetting back to 'flaresolverr:8191'.
+[2026-05-16 09:59:18] [DEBUG] [config] Config validated.
+[2026-05-16 09:59:18] [INFO] [config] Some value(s) in config file did not conform to standard. Logfile has been healed.
+[2026-05-16 09:59:18] [DEBUG] [config] Saved config file.
+[2026-05-16 09:59:18] [INFO] [stacks.server] Production mode: Using multi-process architecture
+[2026-05-16 09:59:18] [INFO] [stacks.server] Stacks initialized
+[2026-05-16 09:59:19] [INFO] [domainupdater] Fetched 3 domain(s) from Wikipedia: ['annas-archive.pk', 'annas-archive.gd', 'annas-archive.gl']
+[2026-05-16 10:00:23] [INFO] [worker.scraper-1] Scraper process stopping
+[2026-05-16 10:00:23] [INFO] [worker.coordinator-1] Coordinator process stopping
+[2026-05-16 10:00:23] [INFO] [worker.download-0] Download worker download-0 stopping
+[2026-05-16 10:00:23] [INFO] [worker.coordinator-1] Coordinator process stopped
+[2026-05-16 10:00:23] [INFO] [worker.scraper-1] Scraper process stopped
+[2026-05-16 10:00:23] [INFO] [worker.download-0] Download worker download-0 stopped

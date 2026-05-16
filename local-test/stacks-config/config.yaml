@@ -1,0 +1,35 @@
+server:
+  host: 0.0.0.0
+  port: 7788
+login:
+  username: admin
+  password: $2b$12$i7BA3cavTLgjovp88rRTm.KGdFPTrbupuBLi3Pu0ZhIDw4UChpzhG
+  disable: false
+api:
+  key: null
+  downloader_key: null
+  session_secret: W8PFOun9uS1dl1-rgRDpgTCr_sAJx5j-
+downloads:
+  delay: 2
+  retry_count: 3
+  resume_attempts: 3
+  prefer_title_naming: false
+  include_hash: none
+  incomplete_folder_path: /download/incomplete
+  subdirectories: null
+fast_download:
+  enabled: false
+  key: null
+flaresolverr:
+  enabled: false
+  url: flaresolverr:8191
+  timeout: 60
+proxy:
+  enabled: false
+  url: null
+  username: null
+  password: null
+queue:
+  max_history: 100
+logging:
+  level: INFO
