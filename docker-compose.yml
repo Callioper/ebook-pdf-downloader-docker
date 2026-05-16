@@ -14,11 +14,13 @@ services:
       - ./finished:/finished
       - ./tmp:/tmp/bdw
       - ./db:/db
+      - ./paddlex_cache:/home/app/.paddlex
       - config_data:/app/data
     environment:
       - DOCKER=true
       - TZ=Asia/Shanghai
       - OMP_NUM_THREADS=1
+      - PADDLE_NUM_THREADS=1
     restart: unless-stopped
 
   stacks:
