@@ -38,7 +38,8 @@ RUN python3 -m venv /app/backend/venv-paddle311 && \
     paddlepaddle \
     paddleocr \
     ocrmypdf \
-    ocrmypdf_paddleocr
+    ocrmypdf_paddleocr && \
+    /app/backend/venv-paddle311/bin/python -c "import ocrmypdf_paddleocr; print('PaddleOCR OK')"
 
 # Clone, setup, and clean up in a single layer to avoid git bloat in final image
 RUN git clone --depth 1 https://github.com/Callioper/local-llm-pdf-ocr.git /app/local-llm-pdf-ocr && \

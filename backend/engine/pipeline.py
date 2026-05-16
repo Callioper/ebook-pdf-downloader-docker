@@ -2250,20 +2250,25 @@ async def _step_ocr(task_id: str, task: Dict[str, Any], config: Dict[str, Any], 
         if ocr_engine == "paddleocr":
             _base_dir = os.path.dirname(os.path.dirname(__file__))
             for _cand in [
-                os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
-                os.path.join(_base_dir, "venv-paddle311", "bin", "python"),
                 os.path.join(_base_dir, "venv-paddle311", "bin", "python3"),
+                os.path.join(_base_dir, "venv-paddle311", "bin", "python"),
+                os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
                 sys.executable,
             ]:
                 if not os.path.exists(_cand):
                     continue
                 try:
                     _vr = _sp.run([_cand, "-c", "import ocrmypdf_paddleocr"],
-                                  capture_output=True, timeout=15)
+                                  capture_output=True, timeout=60)
                     if _vr.returncode == 0:
                         _paddle_venv_py = _cand
                         task_store.add_log(task_id, f"PaddleOCR: using venv at {_paddle_venv_py}")
                         break
+                    else:
+                        _stderr = (_vr.stderr or b"").decode(errors="replace")[:200]
+                        task_store.add_log(task_id, f"PaddleOCR: candidate {_cand} import failed: {_stderr}")
+                except _sp.TimeoutExpired:
+                    task_store.add_log(task_id, f"PaddleOCR: candidate {_cand} import timed out (60s)")
                 except Exception as _ce:
                     task_store.add_log(task_id, f"PaddleOCR: candidate {_cand} skipped: {_ce}")
             if not _paddle_venv_py:
