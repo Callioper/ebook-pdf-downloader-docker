@@ -432,6 +432,11 @@ async def config_status():
                  "mineru_token", "paddleocr_online_token", "aa_membership_key"):
         safe.pop(key, None)
 
+    # Docker: migrate old localhost defaults to service names
+    if os.environ.get("DOCKER", "").lower() in ("true", "1", "yes"):
+        if safe.get("stacks_base_url") in ("http://localhost:7788", "http://127.0.0.1:7788", ""):
+            safe["stacks_base_url"] = "http://stacks:7788"
+
     import asyncio as _aio, os as _os
 
     async def _db():

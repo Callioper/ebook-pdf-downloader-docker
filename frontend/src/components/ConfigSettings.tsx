@@ -143,13 +143,13 @@ function SectionHeader({ title, summary, color, expanded, onToggle }: {
   )
 }
 
-const DEFAULT_CONFIG: AppConfig = {
+const getDefaultConfig = (isDocker: boolean): AppConfig => ({
   host: '0.0.0.0',
   port: 8000,
   download_dir: '',
   finished_dir: '',
   tmp_dir: '',
-  stacks_base_url: 'http://localhost:7788',
+  stacks_base_url: isDocker ? 'http://stacks:7788' : 'http://localhost:7788',
   stacks_username: '',
   stacks_password: '',
   theme: 'auto',
@@ -189,7 +189,7 @@ const DEFAULT_CONFIG: AppConfig = {
   pdf_compress: false,
   pdf_compress_half: true,
   filename_template: '{title}',
-}
+});
 
 const OCR_ENGINES = [
   { key: 'tesseract', name: 'Tesseract OCR', desc: '内置引擎，需 chi_sim 语言包' },
@@ -353,7 +353,7 @@ export default function ConfigSettings() {
   const { openTocModal } = useOutletContext<{ openTocModal: (pdfPath: string, taskId?: string) => void }>()
   const isDocker = useStore(s => s.isDocker)
   const [config, setConfig] = useState<AppConfig | null>(null)
-  const [form, setForm] = useState<AppConfig>({ ...DEFAULT_CONFIG })
+  const [form, setForm] = useState<AppConfig>(() => getDefaultConfig(isDocker))
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState('')
@@ -467,7 +467,7 @@ export default function ConfigSettings() {
       delete data._auto
 
       setConfig(data)
-      const merged = { ...DEFAULT_CONFIG, ...data }
+      const merged = { ...getDefaultConfig(isDocker), ...data }
       setForm(merged)
 
       // Apply auto-detect results from consolidated response
@@ -481,7 +481,7 @@ export default function ConfigSettings() {
         setOcrChecking(false)
       }
     } catch (e) {
-      if (mountedRef.current) setConfig(DEFAULT_CONFIG)
+      if (mountedRef.current) setConfig(getDefaultConfig(isDocker))
     } finally {
       if (mountedRef.current) setLoading(false)
     }
