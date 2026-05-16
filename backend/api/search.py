@@ -1186,18 +1186,22 @@ async def check_ocr(engine: str = Query(default="")):
         elif engine == "paddleocr":
             _base_dir = os.path.dirname(os.path.dirname(__file__))
             _venv_candidates = [
-                os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
-                os.path.join(_base_dir, "venv-paddle311", "bin", "python"),
                 os.path.join(_base_dir, "venv-paddle311", "bin", "python3"),
+                os.path.join(_base_dir, "venv-paddle311", "bin", "python"),
+                os.path.join(_base_dir, "venv-paddle311", "Scripts", "python.exe"),
                 sys.executable,
             ]
+            _venv_ok = False
             for _venv_py in _venv_candidates:
                 if os.path.exists(_venv_py):
                     r = subprocess.run([_venv_py, "-c", "import paddleocr; print(paddleocr.__version__)"],
-                                       capture_output=True, text=True, timeout=15)
+                                       capture_output=True, text=True, timeout=60)
                     if r.returncode == 0:
-                        return {"ok": True, "engine": "paddleocr", "version": r.stdout.strip().split("\n")[0], "venv": _venv_py}
-                    return {"ok": False, "engine": "paddleocr", "message": "venv 存在但 paddleocr 未安装", "venv": _venv_py}
+                        ver = r.stdout.strip().split("\n")[0]
+                        return {"ok": True, "engine": "paddleocr", "version": ver if ver != "ok" else "已安装", "venv": _venv_py}
+                    _venv_ok = True  # venv exists but import failed
+            if _venv_ok:
+                return {"ok": False, "engine": "paddleocr", "message": "venv 存在但 paddleocr 未安装"}
             py = _pip_install_cmd()[0]
             r = subprocess.run([py, "-c", "import paddleocr; print(paddleocr.__version__)"],
                                capture_output=True, text=True, timeout=10)
@@ -1373,12 +1377,22 @@ async def install_ocr(body: InstallOCRRequest):
             # Create Python 3.11 venv for PaddleOCR (incompatible with 3.14)
             _base_dir = os.path.dirname(os.path.dirname(__file__))
             _venv_dir = os.path.join(_base_dir, "venv-paddle311")
-            _venv_py = os.path.join(_venv_dir, "Scripts", "python.exe")
+
+            # Check if venv already exists with a valid Python
+            _venv_py = ""
+            for _c in [
+                os.path.join(_venv_dir, "bin", "python3"),
+                os.path.join(_venv_dir, "bin", "python"),
+                os.path.join(_venv_dir, "Scripts", "python.exe"),
+            ]:
+                if os.path.exists(_c):
+                    _venv_py = _c
+                    break
 
             # Check if venv already exists and paddleocr works
-            if os.path.exists(_venv_py):
+            if _venv_py:
                 r_check = subprocess.run([_venv_py, "-c", "import paddleocr"],
-                                         capture_output=True, timeout=15)
+                                         capture_output=True, timeout=60)
                 if r_check.returncode == 0:
                     return {"ok": True, "message": "PaddleOCR venv 已就绪"}
 

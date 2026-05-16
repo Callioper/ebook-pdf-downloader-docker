@@ -116,6 +116,7 @@ async def _startup_configure_stacks():
     uname = cfg.get("stacks_username", "")
     passwd = cfg.get("stacks_password", "")
     if not url or not uname or not passwd:
+        logger.info("Stacks: skipping auto-config (no credentials saved yet)")
         return
     import asyncio, httpx
     for i in range(10):
@@ -123,6 +124,7 @@ async def _startup_configure_stacks():
             async with httpx.AsyncClient(timeout=5) as c:
                 lr = await c.post(f"{url}/login", json={"username": uname, "password": passwd})
                 if lr.status_code != 200:
+                    logger.info(f"Stacks: login attempt {i+1}/10 failed (HTTP {lr.status_code})")
                     await asyncio.sleep(3)
                     continue
                 # Check if FlareSolverr is enabled
@@ -137,8 +139,10 @@ async def _startup_configure_stacks():
                     logger.info("Stacks: FlareSolverr auto-enabled via API")
                 else:
                     logger.info("Stacks: FlareSolverr already enabled")
+                logger.info("Stacks: auto-config OK")
                 break
-        except Exception:
+        except Exception as e:
+            logger.info(f"Stacks: auto-config attempt {i+1}/10 failed: {e}")
             await asyncio.sleep(3)
     else:
         logger.warning("Stacks: could not auto-configure FlareSolverr after 10 attempts")
