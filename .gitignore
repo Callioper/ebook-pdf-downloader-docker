@@ -53,3 +53,4 @@ ebook-db/
 *.exe
 *.dmg
 *.tar
+local-test/
