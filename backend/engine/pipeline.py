@@ -995,7 +995,10 @@ async def _download_via_aa_and_stacks(
                             dest = os.path.join(dl_dir, fname)
                             if os.path.abspath(found_path) == os.path.abspath(dest):
                                 return found_path
-                            shutil.copy2(found_path, dest)
+                            try:
+                                shutil.copy2(found_path, dest)
+                            except shutil.SameFileError:
+                                return found_path
                             return dest
                         return found_path
 
@@ -1406,7 +1409,10 @@ async def _download_via_aa_and_stacks(
                                 pass
                         dest = os.path.join(download_dir, f"{ss_code}_{safe_title}{ext}" if ss_code else f"{safe_title}{ext}")
                         if os.path.abspath(stack_result) != os.path.abspath(dest):
-                            shutil.copy2(stack_result, dest)
+                            try:
+                                shutil.copy2(stack_result, dest)
+                            except shutil.SameFileError:
+                                pass
                             task_store.add_log(task_id, f"AA: copied to download dir: {dest}")
                             return dest
                         return stack_result
@@ -1976,8 +1982,12 @@ async def _step_convert_pdf(task_id: str, task: Dict[str, Any], config: Dict[str
                         ext = os.path.splitext(fname)[1] or ".pdf"
                         new_name = f"{ss_code}_{safe_title}{ext}" if ss_code else f"{safe_title}{ext}"
                         dest_path = os.path.join(out_dir, new_name)
-                        shutil.copy2(dl_path, dest_path)
-                        report["pdf_path"] = dest_path
+                        if os.path.abspath(dl_path) != os.path.abspath(dest_path):
+                            try:
+                                shutil.copy2(dl_path, dest_path)
+                            except shutil.SameFileError:
+                                pass
+                            report["pdf_path"] = dest_path
                         task_store.add_log(task_id, f"PDF copied to download dir: {dest_path}")
                     await _emit(task_id, "step_progress", {"step": "convert_pdf", "progress": 100})
                     return report
@@ -1996,7 +2006,11 @@ async def _step_convert_pdf(task_id: str, task: Dict[str, Any], config: Dict[str
                     ext = os.path.splitext(from_path)[1] or ".pdf"
                     new_name = f"{ss_code}_{safe_title}{ext}" if ss_code else f"{safe_title}{ext}"
                     dest_path = os.path.join(out_dir, new_name)
-                    shutil.copy2(from_path, dest_path)
+                    if os.path.abspath(from_path) != os.path.abspath(dest_path):
+                        try:
+                            shutil.copy2(from_path, dest_path)
+                        except shutil.SameFileError:
+                            pass
                     report["pdf_path"] = dest_path
                     task_store.add_log(task_id, f"PDF copied to download dir: {dest_path}")
                 else:
