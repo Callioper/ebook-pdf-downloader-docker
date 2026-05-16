@@ -123,6 +123,9 @@ export default function Layout() {
 
   useEffect(() => {
     const init = async () => {
+      const forceReadyTimeout = setTimeout(() => {
+        setAppReady(true)
+      }, 30000)
       const tasks = [
         // 0. Docker detection
         fetch('/api/v1/health')
@@ -191,6 +194,7 @@ export default function Layout() {
       ]
 
       await Promise.allSettled(tasks)
+      clearTimeout(forceReadyTimeout)
       setAppReady(true)
     }
     init()
