@@ -468,7 +468,18 @@ export default function ConfigSettings() {
 
       setConfig(data)
       const merged = { ...getDefaultConfig(isDocker), ...data }
-      setForm(merged)
+      // Preserve sensitive fields redacted by backend (zlib_password, stacks_password, etc.)
+      // These are intentionally omitted from the API response for privacy.
+      const SENSITIVE_KEYS = ['zlib_password', 'stacks_password', 'stacks_api_key',
+        'ai_vision_api_key', 'ai_vision_zhipu_key', 'ai_vision_doubao_key',
+        'mineru_token', 'paddleocr_online_token', 'aa_membership_key']
+      setForm(prev => {
+        const patched = { ...merged }
+        for (const k of SENSITIVE_KEYS) {
+          if (prev[k]) patched[k] = prev[k]
+        }
+        return patched
+      })
 
       // Apply auto-detect results from consolidated response
       if (auto.database?.ok) {
