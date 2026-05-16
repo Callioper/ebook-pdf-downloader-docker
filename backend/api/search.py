@@ -1214,7 +1214,7 @@ async def check_ocr(engine: str = Query(default="")):
 
 
 class StacksLoginRequest(BaseModel):
-    url: str = "http://localhost:7788"
+    url: str = "http://stacks:7788"
     username: str = ""
     password: str = ""
 
@@ -1878,7 +1878,8 @@ async def system_status():
         port = cfg.get("flaresolverr_port", 8191)
         try:
             async with _httpx.AsyncClient(timeout=2, verify=False) as c:
-                await c.get(f"http://localhost:{port}")
+                host = "flaresolverr" if is_docker() else "localhost"
+                await c.get(f"http://{host}:{port}")
             return "flaresolverr", {"ok": True, "detail": f"端口 {port}"}
         except Exception:
             return "flaresolverr", {"ok": False, "detail": f"端口 {port} 不可达"}

@@ -54,3 +54,4 @@ ebook-db/
 *.dmg
 *.tar
 local-test/
+docker-compose.test.yml

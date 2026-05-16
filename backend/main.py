@@ -94,8 +94,8 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "http://localhost:5173",
-    ],
-    allow_credentials=True,
+    ] if not is_docker() else ["*"],
+    allow_credentials=True if not is_docker() else False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

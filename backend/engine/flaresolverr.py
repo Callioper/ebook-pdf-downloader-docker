@@ -29,7 +29,8 @@ def _get_flare_port(config: Optional[Dict[str, Any]] = None) -> int:
 def _flare_url(port: Optional[int] = None, endpoint: str = "/v1") -> str:
     if port is None:
         port = _FS_PORT
-    return f"http://localhost:{port}{endpoint}"
+    host = "flaresolverr" if is_docker() else "localhost"
+    return f"http://{host}:{port}{endpoint}"
 
 
 # Module-level port (overridden by set_flare_port)
@@ -317,7 +318,7 @@ async def download_via_flaresolverr(
 
 
 async def get_page_content(url: str, proxy: str = "") -> Optional[str]:
-    flare_url = "http://localhost:8191/v1"
+    flare_url = f"http://{'flaresolverr' if is_docker() else 'localhost'}:8191/v1"
 
     try:
         payload = {
@@ -354,7 +355,7 @@ async def get_flaresolverr_cookies(url: str, proxy: str = "") -> Optional[Dict[s
     Returns a dict of cookie name → value that can be used with requests.
     """
     session_name = f"aa_{int(time.time())}"
-    flare_url = "http://localhost:8191/v1"
+    flare_url = f"http://{'flaresolverr' if is_docker() else 'localhost'}:8191/v1"
 
     try:
         # Create session
@@ -420,7 +421,7 @@ async def download_file_via_flaresolverr(
     from urllib.parse import urljoin
 
     session_name = f"dl_{int(time.time())}"
-    flare_url = "http://localhost:8191/v1"
+    flare_url = f"http://{'flaresolverr' if is_docker() else 'localhost'}:8191/v1"
 
     try:
         requests.post(flare_url, json={
