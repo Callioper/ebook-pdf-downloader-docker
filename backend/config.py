@@ -94,6 +94,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 
 def _default_paths() -> Dict[str, str]:
+    if is_docker():
+        return {}  # Docker paths already set in DEFAULT_CONFIG
     home = Path.home()
     default_download = str(home / "Downloads" / "book-downloader")
     return {
