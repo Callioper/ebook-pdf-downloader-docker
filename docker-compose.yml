@@ -20,7 +20,13 @@ services:
       - DOCKER=true
       - TZ=Asia/Shanghai
       - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
       - PADDLE_NUM_THREADS=1
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 8G
     restart: unless-stopped
 
   stacks:
