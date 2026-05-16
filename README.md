@@ -83,7 +83,7 @@ services:
       - /volume1/docker/ebook/stacks-logs:/opt/stacks/logs
     environment:
       - USERNAME=admin
-      - PASSWORD=请修改此密码
+      - PASSWORD=password
       - SOLVERR_URL=flaresolverr:8191
       - TZ=Asia/Shanghai
     restart: unless-stopped
@@ -143,7 +143,7 @@ services:
       - /share/Public/ebook/stacks-logs:/opt/stacks/logs
     environment:
       - USERNAME=admin
-      - PASSWORD=请修改此密码
+      - PASSWORD=password
       - SOLVERR_URL=flaresolverr:8191
       - TZ=Asia/Shanghai
     restart: unless-stopped
