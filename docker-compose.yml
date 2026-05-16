@@ -35,7 +35,7 @@ services:
       - FLARESOLVERR_ENABLED=true
       - TZ=Asia/Shanghai
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7788/api/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7788/api/health')"]
       interval: 10s
       timeout: 5s
       retries: 6
