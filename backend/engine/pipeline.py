@@ -857,7 +857,7 @@ async def _download_via_aa_and_stacks(
     if title and not search_queries:
         search_queries.append(("title", title))
 
-    from engine.aa_downloader import search_aa, get_md5_details, batch_get_md5_details, get_stacks_api_key, _calc_title_relevance, verify_md5, resolve_download_url
+    from engine.aa_downloader import search_aa, get_md5_details, batch_get_md5_details, get_stacks_api_key, _calc_title_relevance, verify_md5, resolve_download_url, _detect_stacks_failure
 
     all_md5_entries = []
     for qtype, qval in search_queries:
@@ -1138,7 +1138,7 @@ async def _download_via_aa_and_stacks(
                                     if not ss_code:
                                         task_store.add_log(task_id, f"AA:   no SS code, skip history (SSID={hist_ssid} unverifiable)")
                                         continue
-                                    if hist_ssid != ss_code:
+                                    if not hist_ssid.startswith(ss_code):
                                         task_store.add_log(task_id, f"AA:   history SSID={hist_ssid} ≠ target SSID={ss_code}, skip")
                                         continue
                                     found = _find_stacks_file(fname, "", extra_search_paths)
@@ -1279,7 +1279,7 @@ async def _download_via_aa_and_stacks(
                                                     return None
                                                 task_store.add_log(task_id, f"AA: no SS code, skip history (SSID={hist_ssid} unverifiable)")
                                                 continue
-                                            if hist_ssid != ss_code:
+                                            if not hist_ssid.startswith(ss_code):
                                                 task_store.add_log(task_id, f"AA:   history SSID={hist_ssid} ≠ target SSID={ss_code}, skip")
                                                 continue
                                             found = _find_stacks_file(fname, "", extra_search_paths)
@@ -1325,6 +1325,36 @@ async def _download_via_aa_and_stacks(
                                         if isinstance(item, dict) and item.get("md5") == md5 and not item.get("completed_at"):
                                             dl_info = item
                                             break
+
+                                    # 3d. Failure detection — check /api/status for a failed item
+                                    failed_msg = _detect_stacks_failure(sd, md5)
+                                    if failed_msg:
+                                        # Try to extract detail from stacks' own logs
+                                        log_detail_lines = []
+                                        try:
+                                            lr = _req.get(f"{url}/api/logs", headers=_bearer(), timeout=5)
+                                            if lr.status_code == 200:
+                                                for line in lr.text.splitlines()[-20:]:
+                                                    lowered = line.lower()
+                                                    if md5.lower() in lowered or md5[:8] in lowered or any(
+                                                        kw in lowered for kw in ("failed", "403", "error", "mirror", "refused")
+                                                    ):
+                                                        log_detail_lines.append(line.strip()[:200])
+                                        except Exception:
+                                            pass
+
+                                        task_store.add_log(task_id, f"AA: stacks download FAILED: {failed_msg}")
+                                        if log_detail_lines:
+                                            for ln in log_detail_lines:
+                                                task_store.add_log(task_id, f"AA: stacks log | {ln}")
+
+                                        if progress_data is not None:
+                                            progress_data["progress"] = 0
+                                            progress_data["detail"] = f"stacks failed: {failed_msg[:80]}"
+                                            progress_data["eta"] = ""
+
+                                        return None  # bail immediately — no point waiting for timeout
+
                                     if dl_info:
                                         progress = dl_info.get("progress", {})
                                         if isinstance(progress, dict):
