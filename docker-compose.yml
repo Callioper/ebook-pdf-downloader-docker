@@ -18,6 +18,7 @@ services:
     environment:
       - DOCKER=true
       - TZ=Asia/Shanghai
+      - OMP_NUM_THREADS=4
     restart: unless-stopped
 
   stacks:
