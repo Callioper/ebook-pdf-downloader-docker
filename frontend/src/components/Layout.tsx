@@ -173,7 +173,7 @@ export default function Layout() {
         fetch('/api/v1/config')
           .then(r => r.json())
           .then(cfg => {
-            const url = cfg.stacks_base_url || 'http://localhost:7788'
+            const url = cfg.stacks_base_url || (isDocker ? 'http://stacks:7788' : 'http://localhost:7788')
             const uname = cfg.stacks_username || ''
             const passwd = cfg.stacks_password || ''
             if (!uname || !passwd) return

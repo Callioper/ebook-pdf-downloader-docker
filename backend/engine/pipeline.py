@@ -993,6 +993,8 @@ async def _download_via_aa_and_stacks(
                         if dl_dir:
                             fname = os.path.basename(found_path)
                             dest = os.path.join(dl_dir, fname)
+                            if os.path.abspath(found_path) == os.path.abspath(dest):
+                                return found_path
                             shutil.copy2(found_path, dest)
                             return dest
                         return found_path

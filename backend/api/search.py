@@ -408,6 +408,9 @@ async def get_config_endpoint():
                  "ai_vision_api_key", "ai_vision_zhipu_key", "ai_vision_doubao_key",
                  "mineru_token", "paddleocr_online_token", "aa_membership_key"):
         safe.pop(key, None)
+    if os.environ.get("DOCKER", "").lower() in ("true", "1", "yes"):
+        if safe.get("stacks_base_url") in ("http://localhost:7788", "http://127.0.0.1:7788", ""):
+            safe["stacks_base_url"] = "http://stacks:7788"
     return safe
 
 
@@ -426,16 +429,13 @@ async def update_config_endpoint(data: Dict[str, Any]):
 async def config_status():
     """Return full config + auto-detect statuses in one call to avoid N round trips."""
     cfg = get_config()
-    safe = dict(cfg)
-    for key in ("zlib_password", "stacks_password", "stacks_api_key",
-                 "ai_vision_api_key", "ai_vision_zhipu_key", "ai_vision_doubao_key",
-                 "mineru_token", "paddleocr_online_token", "aa_membership_key"):
-        safe.pop(key, None)
 
     # Docker: migrate old localhost defaults to service names
     if os.environ.get("DOCKER", "").lower() in ("true", "1", "yes"):
-        if safe.get("stacks_base_url") in ("http://localhost:7788", "http://127.0.0.1:7788", ""):
-            safe["stacks_base_url"] = "http://stacks:7788"
+        if cfg.get("stacks_base_url") in ("http://localhost:7788", "http://127.0.0.1:7788", ""):
+            cfg["stacks_base_url"] = "http://stacks:7788"
+
+    safe = dict(cfg)
 
     import asyncio as _aio, os as _os
 
