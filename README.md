@@ -305,10 +305,6 @@ docker compose up -d
 
 ## 📄 许可证
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-purple?style=for-the-badge" /></a>
-</p>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-purple?style=for-the-badge" /></a>
 
-<p align="center">
-  MIT © Ebook PDF Downloader — 基于 <a href="https://github.com/Callioper/ebook-pdf-downloader">Callioper/ebook-pdf-downloader</a>
-</p>
+MIT © Ebook PDF Downloader — 基于 [Callioper/ebook-pdf-downloader](https://github.com/Callioper/ebook-pdf-downloader)
