@@ -20,4 +20,3 @@ uharfbuzz==0.54.1
 httpx==0.28.1
 pikepdf==10.5.1
 Pillow>=10.0.0
-libgen-api-enhanced>=1.0.0
