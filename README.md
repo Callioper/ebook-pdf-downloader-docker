@@ -1,35 +1,52 @@
-# 📚 Ebook PDF Downloader (Docker)
+<p align="center">
+  <h1 align="center">🐳 Ebook PDF Downloader (Docker)</h1>
+</p>
 
-> **GitHub:** https://github.com/Callioper/ebook-pdf-downloader-docker
+<p align="center">
+  <a href="https://docker.com"><img src="https://img.shields.io/badge/Docker-20.10%2B-2496ED?style=flat-square&logo=docker&logoColor=white" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-purple?style=flat-square" /></a>
+  <a href="https://github.com/PaddlePaddle/PaddleOCR"><img src="https://img.shields.io/badge/OCR-PaddleOCR_|_Tesseract_|_LLM-orange?style=flat-square" /></a>
+  <a href="https://github.com/Callioper/ebook-pdf-downloader-docker"><img src="https://img.shields.io/badge/Platform-amd64_|_arm64-green?style=flat-square" /></a>
+</p>
 
-[![Docker](https://img.shields.io/badge/Docker-20.10%2B-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docker.com)
-[![License](https://img.shields.io/badge/License-MIT-purple?style=for-the-badge)](LICENSE)
-[![OCR](https://img.shields.io/badge/OCR-PaddleOCR%20%7C%20Tesseract%20%7C%20LLM-orange?style=for-the-badge)](https://github.com/PaddlePaddle/PaddleOCR)
-[![Platform](https://img.shields.io/badge/Platform-amd64%20%7C%20arm64-green?style=for-the-badge)](https://github.com/Callioper/ebook-pdf-downloader-docker)
-
-> 四服务协同的电子书下载 / OCR / 智能目录 Docker 方案。全 OCR 引擎内置，支持 x86 和 ARM（群晖 / 威联通 / 绿联）。
+<p align="center">
+  <b>四服务协同的电子书下载 / OCR / 智能目录 Docker 方案。<br/>全 OCR 引擎内置，支持 x86 和 ARM（群晖 / 威联通 / 绿联）。</b>
+</p>
 
 ---
 
-## 镜像地址
+## 📑 目录
+
+- [📦 镜像地址](#-镜像地址)
+- [🗂️ 四服务说明](#️-四服务说明)
+- [🚀 NAS 一键部署](#-nas-一键部署)
+- [🖥️ Docker Compose 通用部署](#️-docker-compose-通用部署)
+- [⚙️ 初始化配置](#️-初始化配置)
+- [📂 目录说明](#-目录说明)
+- [🔄 升级](#-升级)
+- [🛠️ 故障排查](#️-故障排查)
+
+---
+
+## 📦 镜像地址
 
 | Registry | 适用 | 命令 |
-|----------|------|------|
-| **阿里云 ACR**（推荐） | 国内 | `docker pull crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest` |
-| **Docker Hub** | 通用 | `docker pull elevenforhp/ebook-pdf-downloader-docker:latest` |
-| **GitHub GHCR** | 国际 | `docker pull ghcr.io/callioper/ebook-pdf-downloader-docker:latest` |
+|:---|:---|:---|
+| **阿里云 ACR**（推荐） | 🏠 国内 | `docker pull crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com/ebook-pdf-downloader-docker/ebook-pdf-downloader-docker:latest` |
+| **Docker Hub** | 🌍 通用 | `docker pull elevenforhp/ebook-pdf-downloader-docker:latest` |
+| **GitHub GHCR** | 🌐 国际 | `docker pull ghcr.io/callioper/ebook-pdf-downloader-docker:latest` |
 
 ---
 
-## 四服务说明
+## 🗂️ 四服务说明
 
-| 服务 | 镜像 | 端口 | 用途 |
-|------|------|:--:|------|
-| **app** | ACR | 8000 | 主程序：搜索、下载、OCR、书签 |
-| **stacks** | ACR | 7788 | AA 下载队列管理器（ACR 镜像由 Actions 自动同步） |
-| **flaresolverr** | ACR | 8191 | Cloudflare / DDoS-Guard 绕过（ACR 镜像由 Actions 自动同步） |
+| 服务 | 端口 | 用途 |
+|:---|:--:|:---|
+| **app** | `8000` | 主程序：搜索、下载、OCR、书签 |
+| **stacks** | `7788` | AA 下载队列管理器 |
+| **flaresolverr** | `8191` | Cloudflare / DDoS-Guard 绕过 |
 
-> 三服务默认均使用阿里云 ACR（国内秒级拉取）。备选地址见"镜像地址"章节。
+> **ℹ️** 三服务均使用阿里云 ACR 镜像（国内秒级拉取），Actions 自动同步。备选地址见上方镜像地址表。
 
 ---
 
@@ -46,12 +63,15 @@ mkdir -p /your-nas-path/ebook/{downloads,finished,tmp,db,stacks-config,stacks-lo
 cp DX_2.0-5.0.db /your-nas-path/ebook/db/
 ```
 
-### 群晖 (Synology)
+### 🔴 群晖 (Synology)
 
 **Container Manager (DSM 7.2+)：**
 
 1. Container Manager → 项目 → **新增** → 项目名称 `ebook`
 2. 来源选"创建 docker-compose.yml"，粘贴：
+
+<details>
+<summary>📋 点击展开群晖 docker-compose.yml</summary>
 
 ```yaml
 services:
@@ -101,17 +121,22 @@ volumes:
   config_data:
 ```
 
+</details>
+
 3. **下一步** → **完成**
 4. 访问 `http://<NAS_IP>:8000`
 
 ---
 
-### 威联通 (QNAP)
+### 🟢 威联通 (QNAP)
 
 **Container Station：**
 
 1. Container Station → **创建** → **创建应用程序**
 2. 粘贴 YAML（路径已适配 QNAP）：
+
+<details>
+<summary>📋 点击展开威联通 docker-compose.yml</summary>
 
 ```yaml
 services:
@@ -161,20 +186,21 @@ volumes:
   config_data:
 ```
 
-3. File Station → Public → 创建 `ebook` 文件夹，内含六个子文件夹：
-   `downloads` `finished` `tmp` `db` `stacks-config` `stacks-logs`
+</details>
+
+3. File Station → Public → 创建 `ebook` 文件夹，内含六个子文件夹：`downloads` `finished` `tmp` `db` `stacks-config` `stacks-logs`
 4. 将 `DX_2.0-5.0.db` 上传到 `db`
 5. 创建 → 访问 `http://<NAS_IP>:8000`
 
-> 私有镜像仓库需先添加：Container Station → 设置 → Registry → 新增 `crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com`，用户名改为你的 ACR 账号
+> **⚠️ 私有镜像仓库**需先添加：Container Station → 设置 → Registry → 新增 `crpi-v5h0koewouiw970u.cn-shanghai.personal.cr.aliyuncs.com`
 
 ---
 
-### 绿联 (UGREEN)
+### 🟡 绿联 (UGREEN)
 
 支持 docker-compose 的话，参考群晖版 YAML，路径改为 `/volume1/docker/ebook/...` 即可。
 
-如果不支持 compose，分别拉取四个镜像后手动创建容器，端口和路径同上。绿联 UGOS Pro 确认支持 compose 后，推荐直接用群晖版 YAML。
+如果不支持 compose，分别拉取三个镜像后手动创建容器，端口和路径同上。绿联 UGOS Pro 确认支持 compose 后，推荐直接用群晖版 YAML。
 
 ---
 
@@ -196,7 +222,7 @@ cd ebook
 docker compose up -d
 ```
 
-> 本地构建：`git clone https://github.com/Callioper/ebook-pdf-downloader-docker.git && cd ebook-pdf-downloader-docker && docker compose build && docker compose up -d`
+> **💡 本地构建**：`git clone https://github.com/Callioper/ebook-pdf-downloader-docker.git && cd ebook-pdf-downloader-docker && docker compose build && docker compose up -d`
 
 ---
 
@@ -204,9 +230,7 @@ docker compose up -d
 
 访问 `http://<IP>:8000`，右上角 ⚙️ 进入设置。
 
-> **三服务均使用阿里云 ACR**，Actions 自动同步。如遇拉取问题，检查是否已添加 ACR 私有仓库认证。
-
-### 第一步：配置 Stacks（AA 下载服务器）
+### 🥇 第一步：配置 Stacks（AA 下载服务器）
 
 1. 访问 `http://<IP>:7788`，用户名 `admin`，密码 `stacks`
 2. 进入 Settings → **修改密码** → 复制 API Key
@@ -214,31 +238,31 @@ docker compose up -d
    - `stacks_base_url`: `http://stacks:7788`
    - `stacks_api_key`: 刚才复制的 API Key
 
-### 第二步：下载来源
+### 🥈 第二步：下载来源
 
 | 配置项 | 说明 |
-|--------|------|
+|:---|:---|
 | `zlib_email` / `zlib_password` | Z-Library 账号 |
 | `http_proxy` | 代理地址。宿主机 Clash 填 `http://host.docker.internal:7890`（不要用 `192.168.x.x`） |
 
-### 第三步：本地数据库
+### 🥉 第三步：本地数据库
 
 路径已默认 `/db`，`stacks_base_url` 设为 `http://stacks:7788` 后即可搜索本地数据库。
 
-### OCR 引擎
+### 🧠 OCR 引擎
 
 | 引擎 | 说明 |
-|------|------|
-| **Tesseract**（默认） | 零配置 |
+|:---|:---|
+| **Tesseract**（默认） | 零配置，开箱即用 |
 | **PaddleOCR** | 已内置，切换即可 |
-| **LLM OCR** | 需同网运行 LM Studio/Ollama |
+| **LLM OCR** | 需同网运行 LM Studio / Ollama |
 
 ---
 
 ## 📂 目录说明
 
 | 目录 | 存储内容 |
-|------|------|
+|:---|:---|
 | `downloads/` | 下载中的 PDF（app + stacks 共享） |
 | `finished/` | OCR 完成的最终 PDF |
 | `tmp/` | 处理临时文件（可定期清理） |
@@ -260,20 +284,31 @@ docker compose up -d
 
 ## 🛠️ 故障排查
 
+<details>
+<summary><b>📋 常见问题速查表</b></summary>
+
 | 问题 | 解决 |
-|------|------|
+|:---|:---|
 | 搜索无结果 | 确认 `db/` 有 `DX_*.db`，`stacks_base_url` 正确 |
 | AA 下载失败 | 检查 Stacks 是否运行，API Key 是否已填入设置页 |
 | CF 绕过失败 | 确认 flaresolverr 容器运行中 |
 | OCR 失败 | `docker compose logs app \| grep -i ocr` |
 | PaddleOCR 不工作 | `docker compose logs app \| grep -i paddle` |
-| LLM OCR 无响应 | 确认 LM Studio/Ollama 已启动 |
+| LLM OCR 无响应 | 确认 LM Studio / Ollama 已启动 |
 | 端口冲突 | 修改 compose 中 `ports` |
 | 国内拉取慢 | 使用 ACR 地址 |
 | 容器启动后秒退 | `docker compose logs` 查看错误 |
+
+</details>
 
 ---
 
 ## 📄 许可证
 
-MIT © Ebook PDF Downloader — 基于 [Callioper/ebook-pdf-downloader](https://github.com/Callioper/ebook-pdf-downloader) v1.3.0
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-purple?style=for-the-badge" /></a>
+</p>
+
+<p align="center">
+  MIT © Ebook PDF Downloader — 基于 <a href="https://github.com/Callioper/ebook-pdf-downloader">Callioper/ebook-pdf-downloader</a>
+</p>
